@@ -84,6 +84,31 @@ button:active {
   background-color: #e8e8e8;
 }
 
+.warn {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #fff8e1;
+  border: 1px solid #ffd54f;
+  color: #6d4c00;
+  font-size: 12px;
+}
+
+.error {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #ffebee;
+  border: 1px solid #ef9a9a;
+  color: #b71c1c;
+  font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+.status-card + .status-card {
+  margin-top: 16px;
+}
+
 .footer {
   margin-top: 32px;
   font-size: 12px;
