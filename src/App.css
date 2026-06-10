@@ -1,0 +1,133 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Avenir", Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #0f0f0f;
+  background-color: #f6f6f6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 60px 32px;
+}
+
+.brand h1 {
+  font-size: 32px;
+  font-weight: 700;
+  margin: 0 0 4px 0;
+  letter-spacing: -0.02em;
+}
+
+.brand .tagline {
+  color: #666;
+  margin: 0;
+  font-size: 14px;
+}
+
+.status-card {
+  margin-top: 32px;
+  padding: 24px;
+  border-radius: 12px;
+  background: white;
+  border: 1px solid #e5e5e5;
+}
+
+.status-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+.status-value {
+  font-size: 14px;
+  margin-bottom: 16px;
+  font-family: ui-monospace, Menlo, monospace;
+  color: #333;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid #d0d0d0;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  color: #0f0f0f;
+  background-color: #fff;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+button:hover {
+  border-color: #396cd8;
+  background-color: #f8faff;
+}
+
+button:active {
+  background-color: #e8e8e8;
+}
+
+.footer {
+  margin-top: 32px;
+  font-size: 12px;
+  color: #666;
+}
+
+.footer ul {
+  margin-top: 8px;
+  padding-left: 20px;
+  list-style: none;
+}
+
+.footer li {
+  margin: 4px 0;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #f6f6f6;
+    background-color: #1a1a1a;
+  }
+
+  .status-card {
+    background: #252525;
+    border-color: #383838;
+  }
+
+  .status-value {
+    color: #ddd;
+  }
+
+  button {
+    color: #ffffff;
+    background-color: #2a2a2a;
+    border-color: #444;
+  }
+
+  button:hover {
+    background-color: #333;
+  }
+
+  .footer {
+    color: #999;
+  }
+}

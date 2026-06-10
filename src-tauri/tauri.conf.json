@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CST Studio",
+  "version": "0.1.0",
+  "identifier": "com.mobileoptima.cststudio",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "CST Studio",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 700
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Productivity",
+    "shortDescription": "AI training video generator",
+    "longDescription": "Generate training videos from PowerPoint decks or screen recordings. Local AI writes narration scripts and generates voiceover; ffmpeg renders the final MP4 with branded captions. Fully offline — no API keys or cloud accounts required.",
+    "copyright": "Proprietary, internal Mobile Optima use only"
+  }
+}
