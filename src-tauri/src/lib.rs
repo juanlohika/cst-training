@@ -27,9 +27,11 @@ struct Project {
     main_prompt: String,
     created_at: DateTime<Utc>,
     clips: Vec<Clip>,
-    /// Absolute path to this project's folder on disk. Not persisted — re-derived
-    /// on load so that moving a project folder doesn't break it.
-    #[serde(skip)]
+    /// Absolute path to this project's folder on disk. Re-derived on load
+    /// (so moving a project folder doesn't break it) and stripped before
+    /// writing to project.json by write_project_file. Always present when
+    /// crossing the Tauri IPC boundary so the JS side can use it.
+    #[serde(default)]
     dir: String,
 }
 
@@ -59,7 +61,7 @@ enum ClipStatus {
 
 /// Create a new project folder. If parent_dir/name already exists, the folder
 /// is auto-suffixed with " - YYYYMMDD HHMM" (user picked this collision policy).
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 fn create_project(parent_dir: String, name: String) -> Result<Project, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -103,7 +105,7 @@ fn create_project(parent_dir: String, name: String) -> Result<Project, String> {
 }
 
 /// Load an existing project from its folder.
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 fn load_project(project_dir: String) -> Result<Project, String> {
     let dir = Path::new(&project_dir);
     if !dir.is_dir() {
@@ -132,7 +134,7 @@ fn save_project(project: Project) -> Result<(), String> {
 
 /// Copy a source file into the project as a new clip. Returns the updated
 /// project (with the new clip appended).
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 fn add_clip(project_dir: String, source_path: String) -> Result<Project, String> {
     let project_dir_path = Path::new(&project_dir).to_path_buf();
     let mut project = load_project(project_dir.clone())?;
@@ -193,7 +195,7 @@ fn add_clip(project_dir: String, source_path: String) -> Result<Project, String>
 /// Remove a clip from the project (deletes the folder + updates project.json).
 /// Other clips keep their original IDs — we do NOT renumber, so existing
 /// asset paths stay stable across removals.
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 fn remove_clip(project_dir: String, clip_id: String) -> Result<Project, String> {
     let mut project = load_project(project_dir.clone())?;
     let before = project.clips.len();
@@ -214,7 +216,7 @@ fn remove_clip(project_dir: String, clip_id: String) -> Result<Project, String> 
 /// Reorder clips. Caller provides the full list of clip IDs in the new order.
 /// Folder names stay the same (still "01", "02"...) — only the in-memory order
 /// in clips[] changes. The Vec order is what determines render order later.
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 fn reorder_clips(project_dir: String, ordered_ids: Vec<String>) -> Result<Project, String> {
     let mut project = load_project(project_dir.clone())?;
     if ordered_ids.len() != project.clips.len() {
@@ -238,12 +240,21 @@ fn reorder_clips(project_dir: String, ordered_ids: Vec<String>) -> Result<Projec
     Ok(project)
 }
 
-/// Helper: write project.json atomically-ish (tmp file + rename).
+/// Helper: write project.json atomically-ish (tmp file + rename). Strips
+/// the `dir` field before writing — it's only meaningful at runtime and
+/// re-derived on load.
 fn write_project_file(project: &Project) -> Result<(), String> {
     let dir = PathBuf::from(&project.dir);
     let tmp = dir.join(format!("{PROJECT_FILE}.tmp"));
     let final_path = dir.join(PROJECT_FILE);
-    let pretty = serde_json::to_string_pretty(project)
+    // Serialize to a Value first so we can drop `dir` without changing the
+    // Rust struct shape (which the IPC layer relies on).
+    let mut value = serde_json::to_value(project)
+        .map_err(|e| format!("Cannot serialize project: {e}"))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("dir");
+    }
+    let pretty = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("Cannot serialize project: {e}"))?;
     fs::write(&tmp, pretty)
         .map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
