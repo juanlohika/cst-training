@@ -38,3 +38,25 @@ export interface ExtractResult {
   project: Project;
   frames: FrameInfo[];
 }
+
+export interface NarrationEntry {
+  name: string;
+  timestamp_seconds: number | null;
+  hash: string;
+  text: string | null;
+  inherits_from: string | null;
+}
+
+export interface Narration {
+  version: number;
+  entries: NarrationEntry[];
+}
+
+export interface NarrationProgress {
+  clip_id: string;
+  index: number;
+  total: number;
+  name: string;
+  text: string | null;
+  inherited: boolean;
+}

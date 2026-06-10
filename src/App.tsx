@@ -2,7 +2,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { homeDir, downloadDir } from "@tauri-apps/api/path";
-import type { Project, Clip, FrameInfo, ExtractResult } from "./types";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type {
+  Project,
+  Clip,
+  FrameInfo,
+  ExtractResult,
+  Narration,
+  NarrationEntry,
+  NarrationProgress,
+} from "./types";
 import "./App.css";
 
 /**
@@ -353,6 +362,7 @@ function ProjectView(props: {
             position={i + 1}
             projectDir={project.dir}
             onExtracted={(updated) => onProjectChange(updated)}
+            onNarrated={(updated) => onProjectChange(updated)}
             onRemove={() => removeClip(clip.id)}
             onError={onError}
           />
@@ -366,7 +376,14 @@ function ProjectView(props: {
           <li>✓ Source file picker</li>
           <li>✓ Project model + clip list</li>
           <li>{project.clips.some((c) => c.status !== "draft") ? "✓" : "○"} Extract frames per clip (step b)</li>
-          <li>○ AI vision narration per frame (step c)</li>
+          <li>
+            {project.clips.some(
+              (c) => c.status === "narrated" || c.status === "audio_ready" || c.status === "rendered",
+            )
+              ? "✓"
+              : "○"}{" "}
+            AI vision narration per frame (step c)
+          </li>
           <li>○ AI-generated titles (step d)</li>
           <li>○ TTS audio per clip (step e)</li>
           <li>○ Render final MP4 with title cards + crossfades (step f)</li>
@@ -383,17 +400,32 @@ function ClipRow(props: {
   position: number;
   projectDir: string;
   onExtracted: (project: Project) => void;
+  onNarrated: (project: Project) => void;
   onRemove: () => void;
   onError: (msg: string) => void;
 }) {
-  const { clip, position, projectDir, onExtracted, onRemove, onError } = props;
-  const [busy, setBusy] = useState(false);
+  const { clip, position, projectDir, onExtracted, onNarrated, onRemove, onError } = props;
+  const [busy, setBusy] = useState<"extract" | "narrate" | null>(null);
   const [frames, setFrames] = useState<FrameInfo[] | null>(null);
   const [framesExpanded, setFramesExpanded] = useState(false);
+  const [narration, setNarration] = useState<Narration | null>(null);
+  const [narrationExpanded, setNarrationExpanded] = useState(false);
+  const [narrationProgress, setNarrationProgress] = useState<NarrationProgress | null>(null);
 
-  // If the clip is already extracted (e.g. project just loaded from disk),
-  // fetch the frame list lazily once — only when the user expands the grid,
-  // so opening a project doesn't fan out a Rust call per clip.
+  // Live-stream narration progress events from Rust.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<NarrationProgress>("narration-progress", (event) => {
+        if (event.payload.clip_id !== clip.id) return;
+        setNarrationProgress(event.payload);
+      });
+    })();
+    return () => {
+      unlisten?.();
+    };
+  }, [clip.id]);
+
   const ensureFramesLoaded = useCallback(async () => {
     if (frames !== null) return;
     try {
@@ -407,9 +439,22 @@ function ClipRow(props: {
     }
   }, [frames, projectDir, clip.id, onError]);
 
+  const ensureNarrationLoaded = useCallback(async () => {
+    if (narration !== null) return;
+    try {
+      const n: Narration = await invoke("load_narration", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setNarration(n);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  }, [narration, projectDir, clip.id, onError]);
+
   const extract = async () => {
     if (busy) return;
-    setBusy(true);
+    setBusy("extract");
     try {
       const result: ExtractResult = await invoke("extract_frames", {
         projectDir,
@@ -417,11 +462,36 @@ function ClipRow(props: {
       });
       setFrames(result.frames);
       setFramesExpanded(true);
+      // Wipe any prior narration since frames have changed.
+      setNarration(null);
       onExtracted(result.project);
     } catch (e: any) {
       onError(e?.message || String(e));
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  };
+
+  const narrate = async () => {
+    if (busy) return;
+    setBusy("narrate");
+    setNarrationProgress(null);
+    setNarration({ version: 1, entries: [] });
+    setNarrationExpanded(true);
+    try {
+      const result: Narration = await invoke("narrate_clip", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setNarration(result);
+      // Reload project so status flips to "narrated".
+      const updated: Project = await invoke("load_project", { projectDir });
+      onNarrated(updated);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setBusy(null);
+      setNarrationProgress(null);
     }
   };
 
@@ -430,7 +500,20 @@ function ClipRow(props: {
     setFramesExpanded((v) => !v);
   };
 
+  const toggleNarration = async () => {
+    if (!narrationExpanded) await ensureNarrationLoaded();
+    setNarrationExpanded((v) => !v);
+  };
+
   const hasFrames = clip.status !== "draft";
+  const hasNarration =
+    clip.status === "narrated" ||
+    clip.status === "audio_ready" ||
+    clip.status === "rendered";
+
+  // Build a live "fresh" view of the narration during streaming so the
+  // user sees text materializing rather than only at the very end.
+  const liveEntries: NarrationEntry[] = narration?.entries ?? [];
 
   return (
     <div className="clip-row clip-row--block">
@@ -446,13 +529,14 @@ function ClipRow(props: {
               {clip.status.replace("_", " ")}
             </span>
             {hasFrames && frames !== null && ` · ${frames.length} frames`}
+            {hasNarration && narration && ` · ${narration.entries.filter((e) => e.text).length} narrated`}
           </div>
           {clip.title && <div className="clip-row__title">"{clip.title}"</div>}
         </div>
         <div className="clip-row__actions">
           {!hasFrames && (
-            <button onClick={extract} disabled={busy} className="small">
-              {busy ? "Extracting…" : "Extract frames"}
+            <button onClick={extract} disabled={busy != null} className="small">
+              {busy === "extract" ? "Extracting…" : "Extract frames"}
             </button>
           )}
           {hasFrames && (
@@ -460,12 +544,26 @@ function ClipRow(props: {
               <button onClick={toggleFrames} className="small">
                 {framesExpanded ? "Hide frames" : "View frames"}
               </button>
-              <button onClick={extract} disabled={busy} className="small">
-                {busy ? "Re-extracting…" : "Re-extract"}
+              <button onClick={extract} disabled={busy != null} className="small">
+                {busy === "extract" ? "Re-extracting…" : "Re-extract"}
               </button>
+              <button onClick={narrate} disabled={busy != null} className="small">
+                {busy === "narrate"
+                  ? narrationProgress
+                    ? `Narrating ${narrationProgress.index}/${narrationProgress.total}…`
+                    : "Starting…"
+                  : hasNarration
+                  ? "Re-narrate"
+                  : "Narrate clip"}
+              </button>
+              {hasNarration && (
+                <button onClick={toggleNarration} className="small">
+                  {narrationExpanded ? "Hide script" : "View script"}
+                </button>
+              )}
             </>
           )}
-          <button className="small danger" onClick={onRemove} disabled={busy}>
+          <button className="small danger" onClick={onRemove} disabled={busy != null}>
             Remove
           </button>
         </div>
@@ -487,6 +585,32 @@ function ClipRow(props: {
               </figcaption>
             </figure>
           ))}
+        </div>
+      )}
+
+      {(narrationExpanded || busy === "narrate") && (
+        <div className="narration-panel">
+          {liveEntries.length === 0 && busy !== "narrate" && (
+            <p className="muted">No narration yet.</p>
+          )}
+          {liveEntries
+            .filter((e) => e.text != null)
+            .map((e) => (
+              <div key={e.name} className="narration-line">
+                <span className="narration-line__ts">
+                  {e.timestamp_seconds != null
+                    ? fmtDuration(e.timestamp_seconds)
+                    : `slide ${e.name.replace(/\.jpg$/i, "")}`}
+                </span>
+                <span className="narration-line__text">{e.text}</span>
+              </div>
+            ))}
+          {busy === "narrate" && narrationProgress?.inherited && (
+            <p className="hint">
+              Frame {narrationProgress.index}/{narrationProgress.total}: identical to previous,
+              reusing narration…
+            </p>
+          )}
         </div>
       )}
     </div>

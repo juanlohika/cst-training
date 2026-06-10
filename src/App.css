@@ -273,6 +273,42 @@ button.danger:hover:not(:disabled) {
   font-family: ui-monospace, Menlo, monospace;
 }
 
+/* ---------- Narration panel ---------- */
+
+.narration-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e5e5e5;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.narration-line {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.narration-line:last-child {
+  border-bottom: none;
+}
+
+.narration-line__ts {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: #888;
+  text-align: right;
+  padding-top: 2px;
+}
+
+.narration-line__text {
+  font-size: 13px;
+  color: #222;
+  line-height: 1.5;
+}
+
 .clip-row__name {
   font-size: 13px;
   font-weight: 600;
@@ -440,6 +476,18 @@ button.danger:hover:not(:disabled) {
 
   .clip-row--block .frames-grid {
     border-top-color: #383838;
+  }
+
+  .narration-panel {
+    border-top-color: #383838;
+  }
+
+  .narration-line {
+    border-bottom-color: #2a2a2a;
+  }
+
+  .narration-line__text {
+    color: #ddd;
   }
 
   .thumb img {
