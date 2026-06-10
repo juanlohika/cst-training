@@ -299,6 +299,48 @@ function ProjectView(props: {
     [project.dir, onProjectChange, onError],
   );
 
+  const [generatingTitles, setGeneratingTitles] = useState(false);
+  const generateTitles = async () => {
+    if (generatingTitles) return;
+    setGeneratingTitles(true);
+    try {
+      const updated: Project = await invoke("generate_titles", {
+        projectDir: project.dir,
+      });
+      // Force-sync local text fields to whatever the AI wrote — the
+      // identity-based useEffect above only refreshes on dir change,
+      // but we want the new opening title to populate the input box.
+      setLocalOpening(updated.opening_title_text);
+      onProjectChange(updated);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setGeneratingTitles(false);
+    }
+  };
+
+  const updateClipTitle = useCallback(
+    async (clipId: string, title: string) => {
+      const next: Project = {
+        ...project,
+        clips: project.clips.map((c) => (c.id === clipId ? { ...c, title } : c)),
+      };
+      try {
+        await invoke("save_project", { project: next });
+        onProjectChange(next);
+      } catch (e: any) {
+        onError(e?.message || String(e));
+      }
+    },
+    [project, onProjectChange, onError],
+  );
+
+  // Only allow Generate titles once at least one clip has narration —
+  // otherwise the AI has no context to title from.
+  const hasAnyNarration = project.clips.some(
+    (c) => c.status === "narrated" || c.status === "audio_ready" || c.status === "rendered",
+  );
+
   return (
     <>
       <div className="status-card">
@@ -339,6 +381,21 @@ function ProjectView(props: {
           />
         </label>
 
+        <div className="row row--between">
+          <span className="hint">
+            {hasAnyNarration
+              ? "Generate titles uses your narrations + the project context to write the opening title and per-clip section titles. You can edit them afterward."
+              : "Narrate at least one clip before generating titles — the AI needs that context."}
+          </span>
+          <button
+            onClick={generateTitles}
+            disabled={!hasAnyNarration || generatingTitles}
+            className="small"
+          >
+            {generatingTitles ? "Generating…" : "Generate titles"}
+          </button>
+        </div>
+
         <div className="hint mono">{project.dir}</div>
       </div>
 
@@ -363,6 +420,7 @@ function ProjectView(props: {
             projectDir={project.dir}
             onExtracted={(updated) => onProjectChange(updated)}
             onNarrated={(updated) => onProjectChange(updated)}
+            onTitleChange={(title) => updateClipTitle(clip.id, title)}
             onRemove={() => removeClip(clip.id)}
             onError={onError}
           />
@@ -384,7 +442,13 @@ function ProjectView(props: {
               : "○"}{" "}
             AI vision narration per frame (step c)
           </li>
-          <li>○ AI-generated titles (step d)</li>
+          <li>
+            {(project.opening_title_text.trim() ||
+              project.clips.some((c) => c.title.trim()))
+              ? "✓"
+              : "○"}{" "}
+            AI-generated titles (step d)
+          </li>
           <li>○ TTS audio per clip (step e)</li>
           <li>○ Render final MP4 with title cards + crossfades (step f)</li>
         </ul>
@@ -401,16 +465,37 @@ function ClipRow(props: {
   projectDir: string;
   onExtracted: (project: Project) => void;
   onNarrated: (project: Project) => void;
+  onTitleChange: (title: string) => void;
   onRemove: () => void;
   onError: (msg: string) => void;
 }) {
-  const { clip, position, projectDir, onExtracted, onNarrated, onRemove, onError } = props;
+  const { clip, position, projectDir, onExtracted, onNarrated, onTitleChange, onRemove, onError } = props;
   const [busy, setBusy] = useState<"extract" | "narrate" | null>(null);
   const [frames, setFrames] = useState<FrameInfo[] | null>(null);
   const [framesExpanded, setFramesExpanded] = useState(false);
   const [narration, setNarration] = useState<Narration | null>(null);
   const [narrationExpanded, setNarrationExpanded] = useState(false);
   const [narrationProgress, setNarrationProgress] = useState<NarrationProgress | null>(null);
+  const [localTitle, setLocalTitle] = useState(clip.title);
+
+  // Sync title state when the AI fills it in from outside.
+  const lastTitleFromPropRef = useRef(clip.title);
+  useEffect(() => {
+    if (clip.title !== lastTitleFromPropRef.current) {
+      lastTitleFromPropRef.current = clip.title;
+      setLocalTitle(clip.title);
+    }
+  }, [clip.title]);
+
+  // Debounce title edits to disk same as the project-level fields.
+  useEffect(() => {
+    if (localTitle === clip.title) return;
+    const t = setTimeout(() => {
+      onTitleChange(localTitle);
+      lastTitleFromPropRef.current = localTitle;
+    }, 600);
+    return () => clearTimeout(t);
+  }, [localTitle, clip.title, onTitleChange]);
 
   // Live-stream narration progress events from Rust.
   useEffect(() => {
@@ -488,10 +573,23 @@ function ClipRow(props: {
       const updated: Project = await invoke("load_project", { projectDir });
       onNarrated(updated);
     } catch (e: any) {
-      onError(e?.message || String(e));
+      // "Cancelled by user." is expected when the Stop button is used —
+      // don't show it as an error.
+      const msg = e?.message || String(e);
+      if (!msg.includes("Cancelled by user")) {
+        onError(msg);
+      }
     } finally {
       setBusy(null);
       setNarrationProgress(null);
+    }
+  };
+
+  const stopNarration = async () => {
+    try {
+      await invoke("cancel_narration", { projectDir, clipId: clip.id });
+    } catch (e: any) {
+      onError(e?.message || String(e));
     }
   };
 
@@ -531,7 +629,12 @@ function ClipRow(props: {
             {hasFrames && frames !== null && ` · ${frames.length} frames`}
             {hasNarration && narration && ` · ${narration.entries.filter((e) => e.text).length} narrated`}
           </div>
-          {clip.title && <div className="clip-row__title">"{clip.title}"</div>}
+          <input
+            className="clip-row__title-input"
+            value={localTitle}
+            onChange={(e) => setLocalTitle(e.target.value)}
+            placeholder="Section title (appears on the title card before this clip)"
+          />
         </div>
         <div className="clip-row__actions">
           {!hasFrames && (
@@ -556,7 +659,12 @@ function ClipRow(props: {
                   ? "Re-narrate"
                   : "Narrate clip"}
               </button>
-              {hasNarration && (
+              {busy === "narrate" && (
+                <button onClick={stopNarration} className="small danger">
+                  Stop
+                </button>
+              )}
+              {hasNarration && busy !== "narrate" && (
                 <button onClick={toggleNarration} className="small">
                   {narrationExpanded ? "Hide script" : "View script"}
                 </button>

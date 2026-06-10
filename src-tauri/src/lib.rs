@@ -11,9 +11,41 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Per-clip cancellation flags for the narration loop. The clip key is
+/// "<project_dir>::<clip_id>" so two projects' clips don't collide. The
+/// narrate_clip loop polls its flag every iteration; cancel_narration
+/// flips it. We use Arc so we can hold a clone in the running task even
+/// after the lock is released.
+fn narration_cancels() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    static CANCELS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cancel_key(project_dir: &str, clip_id: &str) -> String {
+    format!("{project_dir}::{clip_id}")
+}
+
+fn register_narration(project_dir: &str, clip_id: &str) -> Arc<AtomicBool> {
+    let key = cancel_key(project_dir, clip_id);
+    let flag = Arc::new(AtomicBool::new(false));
+    narration_cancels()
+        .lock()
+        .unwrap()
+        .insert(key, flag.clone());
+    flag
+}
+
+fn unregister_narration(project_dir: &str, clip_id: &str) {
+    let key = cancel_key(project_dir, clip_id);
+    narration_cancels().lock().unwrap().remove(&key);
+}
 
 const PROJECT_FILE: &str = "project.json";
 const CLIPS_DIR: &str = "clips";
@@ -450,11 +482,27 @@ async fn narrate_clip(
         .build()
         .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
 
+    // Cancellation flag — Stop button in the UI flips this via
+    // cancel_narration. We poll at the top of each loop iteration AND
+    // after each Ollama call returns, so cancellation latency is at most
+    // one frame's inference time.
+    let cancel = register_narration(&project_dir, &clip_id);
+
     let mut entries: Vec<NarrationEntry> = Vec::with_capacity(frames.len());
     let mut last_fresh_idx: Option<usize> = None;
     let mut rolling_context: Vec<String> = Vec::new();
 
     for (i, f) in frames.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            // Save whatever we've done so far + exit cleanly.
+            let partial = Narration {
+                version: NARRATION_SCHEMA_VERSION,
+                entries: entries.clone(),
+            };
+            let _ = write_narration_file(&project_dir, &clip_id, &partial);
+            unregister_narration(&project_dir, &clip_id);
+            return Err("Cancelled by user.".into());
+        }
         let hash = compute_phash(&f.path)?;
 
         // Compare to previous frame's hash; if close enough, inherit.
@@ -547,8 +595,179 @@ async fn narrate_clip(
     // Update the clip's status.
     project.clips[clip_idx].status = ClipStatus::Narrated;
     write_project_file(&project)?;
+    unregister_narration(&project_dir, &clip_id);
 
     Ok(narration)
+}
+
+/// Generate the opening title text + a per-clip section title for the
+/// whole project in a single LLM pass. Reads each clip's narration.json
+/// so the AI sees what each clip actually contains, then writes titles
+/// that fit the project's main_prompt and the order of clips.
+///
+/// We use the same vision model as a text-only LLM (no image) — it's
+/// already loaded, so no extra RAM cost. Returns the updated Project
+/// (titles filled in), which the caller can then edit before render.
+#[tauri::command(rename_all = "camelCase")]
+async fn generate_titles(project_dir: String) -> Result<Project, String> {
+    let mut project = load_project(project_dir.clone())?;
+    if project.clips.is_empty() {
+        return Err("Add at least one clip before generating titles.".into());
+    }
+
+    // Gather a brief excerpt of each clip's narration. We use the first
+    // and last fresh narrations as a "what this clip is about" summary.
+    let mut clip_summaries: Vec<String> = Vec::new();
+    for clip in &project.clips {
+        let narration = load_narration(project_dir.clone(), clip.id.clone()).unwrap_or(Narration {
+            version: NARRATION_SCHEMA_VERSION,
+            entries: Vec::new(),
+        });
+        let fresh: Vec<&str> = narration
+            .entries
+            .iter()
+            .filter_map(|e| e.text.as_deref())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let summary = if fresh.is_empty() {
+            format!("(clip {} has no narration yet)", clip.id)
+        } else if fresh.len() <= 3 {
+            fresh.join(" ")
+        } else {
+            format!(
+                "{} … {}",
+                fresh[0],
+                fresh[fresh.len() - 1]
+            )
+        };
+        clip_summaries.push(format!("Clip {}: {}", clip.id, summary));
+    }
+
+    let prompt = build_titles_prompt(&project.name, &project.main_prompt, &clip_summaries);
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
+
+    let body = serde_json::json!({
+        "model": OLLAMA_VISION_MODEL,
+        "prompt": prompt,
+        "stream": false,
+        "format": "json",
+        "options": {
+            "num_predict": 400,
+            "temperature": 0.5,
+        }
+    });
+
+    let resp = http
+        .post(OLLAMA_URL)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Cannot reach Ollama at {OLLAMA_URL}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Ollama returned {status}: {body}"));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Ollama response not JSON: {e}"))?;
+    let raw_text = json
+        .get("response")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Ollama response missing 'response' field".to_string())?;
+
+    // Parse the model's JSON. Be lenient: strip code fences if it added them.
+    let cleaned = raw_text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let parsed: TitlesResponse = serde_json::from_str(cleaned)
+        .map_err(|e| format!("Could not parse titles JSON from model: {e}\nRaw: {cleaned}"))?;
+
+    // Apply the AI's titles, but never clobber a non-empty user edit.
+    if project.opening_title_text.trim().is_empty() {
+        project.opening_title_text = parsed.opening_title;
+    }
+    for (i, ai_title) in parsed.clip_titles.iter().enumerate() {
+        if let Some(clip) = project.clips.get_mut(i) {
+            if clip.title.trim().is_empty() {
+                clip.title = ai_title.clone();
+            }
+        }
+    }
+    write_project_file(&project)?;
+    Ok(project)
+}
+
+#[derive(Deserialize)]
+struct TitlesResponse {
+    opening_title: String,
+    clip_titles: Vec<String>,
+}
+
+fn build_titles_prompt(project_name: &str, main_prompt: &str, clip_summaries: &[String]) -> String {
+    let mut p = String::new();
+    p.push_str(
+        "You are writing on-screen titles for a training video. Each title \
+         appears as a large text card the viewer reads for 2-3 seconds before \
+         that section plays.\n\n",
+    );
+    p.push_str("PROJECT NAME (internal, not shown on screen): ");
+    p.push_str(project_name);
+    p.push_str("\n\nPROJECT CONTEXT:\n");
+    if main_prompt.trim().is_empty() {
+        p.push_str("(no context provided)\n");
+    } else {
+        p.push_str(main_prompt.trim());
+        p.push('\n');
+    }
+    p.push_str("\nCLIPS IN ORDER (narration excerpts):\n");
+    for s in clip_summaries {
+        p.push_str("- ");
+        p.push_str(s);
+        p.push('\n');
+    }
+    p.push_str(
+        "\nWrite:\n\
+         1. ONE opening title for the whole video — short and welcoming, \
+         like a training-video chapter heading (5-10 words).\n\
+         2. ONE section title per clip — each describes that section's topic \
+         in 3-6 words. Be specific about the workflow step (e.g. \"Time-In\", \
+         \"Submitting the Form\") rather than generic (\"Step One\", \"Section\").\n\
+         \n\
+         Respond with JSON only, exactly this shape:\n\
+         {\"opening_title\": \"...\", \"clip_titles\": [\"...\", \"...\"]}\n\
+         The clip_titles array must have exactly ",
+    );
+    p.push_str(&clip_summaries.len().to_string());
+    p.push_str(
+        " entries, one per clip in order. No prose around the JSON, no code \
+         fences, no preamble.",
+    );
+    p
+}
+
+/// Cancel an in-flight narrate_clip. Sets the per-clip flag the loop
+/// polls; the loop saves partial progress + returns an error. The
+/// already-narrated frames are kept on disk so the user can resume by
+/// clicking "Narrate" again (currently restarts from frame 1; resume is
+/// a Phase 2 enhancement).
+#[tauri::command(rename_all = "camelCase")]
+fn cancel_narration(project_dir: String, clip_id: String) -> Result<(), String> {
+    let key = cancel_key(&project_dir, &clip_id);
+    if let Some(flag) = narration_cancels().lock().unwrap().get(&key) {
+        flag.store(true, Ordering::Relaxed);
+        Ok(())
+    } else {
+        Err("No active narration to cancel for that clip.".into())
+    }
 }
 
 /// Load narration.json for a clip that has been narrated already. Returns
@@ -593,11 +812,21 @@ const NARRATION_CONTEXT_ENTRIES: usize = 2;
 const PHASH_DISTANCE_THRESHOLD: u32 = 5;
 /// Save narration.json every N frames in case of crash / quit mid-run.
 const NARRATION_AUTOSAVE_EVERY: usize = 10;
-/// Vision model name as it appears in `ollama list`. We use Qwen3-VL because
-/// Ollama's 0.30.x release broke Llama 3.2 Vision (see issue #16490). Qwen3-VL
-/// is also better-suited to UI-narration: it's the model purpose-built for
-/// visual-agent benchmarks like OS World.
-const OLLAMA_VISION_MODEL: &str = "qwen3-vl:8b";
+/// Vision model name as it appears in `ollama list`. Settled on minicpm-v:8b
+/// after testing several alternatives:
+///   - llama3.2-vision: broken on Ollama 0.30.x (mllama arch unsupported,
+///     see ollama#16490)
+///   - qwen3-vl:8b: high quality but 60-90s/frame under swap pressure
+///     on 16GB Macs
+///   - qwen3-vl:2b: thinking mode is hard-baked (parser is qwen3-vl-thinking)
+///     — all output tokens go to thinking, none to the response field
+///   - moondream: fast but too shallow ("iphone screen with app icons" on
+///     mobile UIs)
+///   - minicpm-v:8b ✓: no thinking mode, detailed UI-aware narration,
+///     ~5-8s per frame after warmup on 16GB. Reads actual on-screen text
+///     (button labels, dates, list items) which is exactly what we need
+///     for training-video voiceover.
+const OLLAMA_VISION_MODEL: &str = "minicpm-v:8b";
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 /// Compute an 8x8 average-hash perceptual hash of a JPEG. Returns 16 hex
@@ -662,16 +891,17 @@ async fn call_ollama_vision(
          voiceover. Do not think out loud. Output only the narration text."
     );
 
-    // Cap output tokens to keep per-frame inference time tractable on
-    // RAM-constrained Macs. 80 tokens ≈ 60 words, enough headroom over our
-    // 40-word target for the model to land a clean stop.
+    // Cap output tokens to keep per-frame inference time tractable.
+    // 120 tokens ≈ 90 words, enough for minicpm-v to deliver a complete
+    // 1-2 sentence narration; smoke tests on real frames showed ~65 tokens
+    // typical, well within budget.
     let body = serde_json::json!({
         "model": OLLAMA_VISION_MODEL,
         "prompt": prompt,
         "images": [b64],
         "stream": false,
         "options": {
-            "num_predict": 80,
+            "num_predict": 120,
             "temperature": 0.4,
         }
     });
@@ -1076,6 +1306,8 @@ pub fn run() {
             list_frames,
             narrate_clip,
             load_narration,
+            cancel_narration,
+            generate_titles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

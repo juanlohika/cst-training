@@ -329,6 +329,35 @@ button.danger:hover:not(:disabled) {
   font-style: italic;
 }
 
+.clip-row__title-input {
+  width: 100%;
+  margin-top: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  font-style: italic;
+  color: #444;
+  background: transparent;
+  border: 1px dashed transparent;
+  border-radius: 4px;
+}
+
+.clip-row__title-input:hover {
+  border-color: #d0d0d0;
+}
+
+.clip-row__title-input:focus {
+  outline: none;
+  border-color: #396cd8;
+  border-style: solid;
+  background: white;
+  font-style: normal;
+}
+
+.clip-row__title-input::placeholder {
+  color: #aaa;
+}
+
 .status {
   display: inline-block;
   padding: 1px 6px;
@@ -472,6 +501,23 @@ button.danger:hover:not(:disabled) {
 
   .clip-row__title {
     color: #bbb;
+  }
+
+  .clip-row__title-input {
+    color: #ccc;
+  }
+
+  .clip-row__title-input:hover {
+    border-color: #444;
+  }
+
+  .clip-row__title-input:focus {
+    background: #1f1f1f;
+    border-color: #5b8bf0;
+  }
+
+  .clip-row__title-input::placeholder {
+    color: #666;
   }
 
   .clip-row--block .frames-grid {
