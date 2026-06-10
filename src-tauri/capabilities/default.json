@@ -9,6 +9,18 @@
     "dialog:default",
     "fs:default",
     {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "**" }
+      ]
+    },
+    {
+      "identifier": "opener:allow-reveal-item-in-dir",
+      "allow": [
+        { "path": "**" }
+      ]
+    },
+    {
       "identifier": "fs:scope",
       "allow": [
         "$DOCUMENT/**",

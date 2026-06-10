@@ -309,6 +309,94 @@ button.danger:hover:not(:disabled) {
   line-height: 1.5;
 }
 
+.narration-line--editable {
+  grid-template-columns: 56px 1fr;
+}
+
+.narration-line__editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.narration-line__textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #222;
+  background: #fafafa;
+  resize: vertical;
+  min-height: 44px;
+}
+
+.narration-line__textarea:hover {
+  border-color: #e0e0e0;
+  background: white;
+}
+
+.narration-line__textarea:focus {
+  outline: none;
+  border-color: #396cd8;
+  background: white;
+}
+
+.narration-line__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.narration-line__status {
+  font-size: 11px;
+  color: #888;
+  font-style: italic;
+}
+
+/* ---------- Render progress ---------- */
+
+.render-progress {
+  margin-top: 12px;
+}
+
+.render-progress__detail {
+  font-size: 12px;
+  color: #555;
+  margin-bottom: 8px;
+}
+
+.render-progress__stage {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  background: #eee;
+  color: #555;
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 4px;
+}
+
+.render-progress__bar {
+  width: 100%;
+  height: 6px;
+  background: #e5e5e5;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.render-progress__fill {
+  height: 100%;
+  background: linear-gradient(90deg, #396cd8, #044be4);
+  border-radius: 3px;
+  transition: width 0.25s ease;
+}
+
 .clip-row__name {
   font-size: 13px;
   font-weight: 600;
@@ -356,6 +444,68 @@ button.danger:hover:not(:disabled) {
 
 .clip-row__title-input::placeholder {
   color: #aaa;
+}
+
+.clip-row__overview {
+  margin-top: 10px;
+}
+
+.clip-row__overview-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin-bottom: 4px;
+}
+
+.clip-row__overview-input {
+  width: 100%;
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #333;
+  background: white;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.clip-row__overview-input:focus {
+  outline: none;
+  border-color: #396cd8;
+}
+
+.clip-row__overview-input::placeholder {
+  color: #aaa;
+  font-style: italic;
+}
+
+button.link {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: #396cd8;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+button.link:hover:not(:disabled) {
+  background: transparent;
+  text-decoration: underline;
+  border-color: transparent;
+}
+
+button.link:disabled {
+  color: #aaa;
+  cursor: not-allowed;
 }
 
 .status {
@@ -520,6 +670,28 @@ button.danger:hover:not(:disabled) {
     color: #666;
   }
 
+  .clip-row__overview-label {
+    color: #888;
+  }
+
+  .clip-row__overview-input {
+    background: #1f1f1f;
+    color: #ddd;
+    border-color: #383838;
+  }
+
+  .clip-row__overview-input:focus {
+    border-color: #5b8bf0;
+  }
+
+  button.link {
+    color: #5b8bf0;
+  }
+
+  button.link:disabled {
+    color: #555;
+  }
+
   .clip-row--block .frames-grid {
     border-top-color: #383838;
   }
@@ -534,6 +706,38 @@ button.danger:hover:not(:disabled) {
 
   .narration-line__text {
     color: #ddd;
+  }
+
+  .narration-line__textarea {
+    background: #1a1a1a;
+    color: #ddd;
+  }
+
+  .narration-line__textarea:hover {
+    border-color: #383838;
+    background: #1f1f1f;
+  }
+
+  .narration-line__textarea:focus {
+    border-color: #5b8bf0;
+    background: #1f1f1f;
+  }
+
+  .narration-line__status {
+    color: #888;
+  }
+
+  .render-progress__detail {
+    color: #bbb;
+  }
+
+  .render-progress__stage {
+    background: #2a2a2a;
+    color: #ccc;
+  }
+
+  .render-progress__bar {
+    background: #2a2a2a;
   }
 
   .thumb img {

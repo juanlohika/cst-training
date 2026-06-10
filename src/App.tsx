@@ -11,6 +11,8 @@ import type {
   Narration,
   NarrationEntry,
   NarrationProgress,
+  TtsProgress,
+  RenderProgress,
 } from "./types";
 import "./App.css";
 
@@ -335,6 +337,22 @@ function ProjectView(props: {
     [project, onProjectChange, onError],
   );
 
+  const updateClipOverview = useCallback(
+    async (clipId: string, overview: string) => {
+      const next: Project = {
+        ...project,
+        clips: project.clips.map((c) => (c.id === clipId ? { ...c, overview } : c)),
+      };
+      try {
+        await invoke("save_project", { project: next });
+        onProjectChange(next);
+      } catch (e: any) {
+        onError(e?.message || String(e));
+      }
+    },
+    [project, onProjectChange, onError],
+  );
+
   // Only allow Generate titles once at least one clip has narration —
   // otherwise the AI has no context to title from.
   const hasAnyNarration = project.clips.some(
@@ -421,11 +439,18 @@ function ProjectView(props: {
             onExtracted={(updated) => onProjectChange(updated)}
             onNarrated={(updated) => onProjectChange(updated)}
             onTitleChange={(title) => updateClipTitle(clip.id, title)}
+            onOverviewChange={(overview) => updateClipOverview(clip.id, overview)}
             onRemove={() => removeClip(clip.id)}
             onError={onError}
           />
         ))}
       </div>
+
+      <RenderSection
+        project={project}
+        onError={onError}
+        onProjectChange={onProjectChange}
+      />
 
       <div className="footer">
         Phase 1 milestones:
@@ -449,8 +474,18 @@ function ProjectView(props: {
               : "○"}{" "}
             AI-generated titles (step d)
           </li>
-          <li>○ TTS audio per clip (step e)</li>
-          <li>○ Render final MP4 with title cards + crossfades (step f)</li>
+          <li>
+            {project.clips.some(
+              (c) => c.status === "audio_ready" || c.status === "rendered",
+            )
+              ? "✓"
+              : "○"}{" "}
+            TTS audio per clip (step e)
+          </li>
+          <li>
+            {project.clips.some((c) => c.status === "rendered") ? "✓" : "○"}{" "}
+            Render final MP4 with title cards + crossfades (step f)
+          </li>
         </ul>
       </div>
     </>
@@ -466,26 +501,38 @@ function ClipRow(props: {
   onExtracted: (project: Project) => void;
   onNarrated: (project: Project) => void;
   onTitleChange: (title: string) => void;
+  onOverviewChange: (overview: string) => void;
   onRemove: () => void;
   onError: (msg: string) => void;
 }) {
-  const { clip, position, projectDir, onExtracted, onNarrated, onTitleChange, onRemove, onError } = props;
-  const [busy, setBusy] = useState<"extract" | "narrate" | null>(null);
+  const { clip, position, projectDir, onExtracted, onNarrated, onTitleChange, onOverviewChange, onRemove, onError } = props;
+  const [busy, setBusy] = useState<"extract" | "narrate" | "audio" | null>(null);
   const [frames, setFrames] = useState<FrameInfo[] | null>(null);
   const [framesExpanded, setFramesExpanded] = useState(false);
   const [narration, setNarration] = useState<Narration | null>(null);
   const [narrationExpanded, setNarrationExpanded] = useState(false);
   const [narrationProgress, setNarrationProgress] = useState<NarrationProgress | null>(null);
+  const [ttsProgress, setTtsProgress] = useState<TtsProgress | null>(null);
   const [localTitle, setLocalTitle] = useState(clip.title);
+  const [localOverview, setLocalOverview] = useState(clip.overview ?? "");
+  const [generatingOverview, setGeneratingOverview] = useState(false);
 
-  // Sync title state when the AI fills it in from outside.
+  // Sync title + overview from props when the AI fills them in from outside.
   const lastTitleFromPropRef = useRef(clip.title);
+  const lastOverviewFromPropRef = useRef(clip.overview ?? "");
   useEffect(() => {
     if (clip.title !== lastTitleFromPropRef.current) {
       lastTitleFromPropRef.current = clip.title;
       setLocalTitle(clip.title);
     }
   }, [clip.title]);
+  useEffect(() => {
+    const prop = clip.overview ?? "";
+    if (prop !== lastOverviewFromPropRef.current) {
+      lastOverviewFromPropRef.current = prop;
+      setLocalOverview(prop);
+    }
+  }, [clip.overview]);
 
   // Debounce title edits to disk same as the project-level fields.
   useEffect(() => {
@@ -497,6 +544,38 @@ function ClipRow(props: {
     return () => clearTimeout(t);
   }, [localTitle, clip.title, onTitleChange]);
 
+  // Debounce overview edits to disk.
+  useEffect(() => {
+    if (localOverview === (clip.overview ?? "")) return;
+    const t = setTimeout(() => {
+      onOverviewChange(localOverview);
+      lastOverviewFromPropRef.current = localOverview;
+    }, 600);
+    return () => clearTimeout(t);
+  }, [localOverview, clip.overview, onOverviewChange]);
+
+  const generateOverview = async () => {
+    if (generatingOverview) return;
+    setGeneratingOverview(true);
+    try {
+      const updated: Project = await invoke("generate_overview", {
+        projectDir,
+        clipId: clip.id,
+      });
+      // Find this clip in the updated project and sync local overview.
+      const updatedClip = updated.clips.find((c) => c.id === clip.id);
+      if (updatedClip) {
+        setLocalOverview(updatedClip.overview ?? "");
+        lastOverviewFromPropRef.current = updatedClip.overview ?? "";
+      }
+      onNarrated(updated);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setGeneratingOverview(false);
+    }
+  };
+
   // Live-stream narration progress events from Rust.
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -504,6 +583,20 @@ function ClipRow(props: {
       unlisten = await listen<NarrationProgress>("narration-progress", (event) => {
         if (event.payload.clip_id !== clip.id) return;
         setNarrationProgress(event.payload);
+      });
+    })();
+    return () => {
+      unlisten?.();
+    };
+  }, [clip.id]);
+
+  // Live-stream TTS progress events from Rust.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<TtsProgress>("tts-progress", (event) => {
+        if (event.payload.clip_id !== clip.id) return;
+        setTtsProgress(event.payload);
       });
     })();
     return () => {
@@ -593,6 +686,23 @@ function ClipRow(props: {
     }
   };
 
+  const generateAudio = async () => {
+    if (busy) return;
+    setBusy("audio");
+    setTtsProgress(null);
+    try {
+      await invoke("generate_audio", { projectDir, clipId: clip.id });
+      // Status flipped server-side. Reload project so UI reflects audio_ready.
+      const updated: Project = await invoke("load_project", { projectDir });
+      onNarrated(updated); // reuse the same prop — it just re-applies the project
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setBusy(null);
+      setTtsProgress(null);
+    }
+  };
+
   const toggleFrames = async () => {
     if (!framesExpanded) await ensureFramesLoaded();
     setFramesExpanded((v) => !v);
@@ -635,6 +745,31 @@ function ClipRow(props: {
             onChange={(e) => setLocalTitle(e.target.value)}
             placeholder="Section title (appears on the title card before this clip)"
           />
+          {hasNarration && (
+            <div className="clip-row__overview">
+              <div className="clip-row__overview-label">
+                <span>Section overview (plays during the title card)</span>
+                <button
+                  className="link"
+                  onClick={generateOverview}
+                  disabled={generatingOverview}
+                >
+                  {generatingOverview
+                    ? "Generating…"
+                    : (clip.overview ?? "").trim()
+                    ? "Regenerate overview"
+                    : "Generate overview"}
+                </button>
+              </div>
+              <textarea
+                className="clip-row__overview-input"
+                value={localOverview}
+                onChange={(e) => setLocalOverview(e.target.value)}
+                placeholder="The narrator's intro to this section (auto-generated by 'Generate overview', editable)."
+                rows={2}
+              />
+            </div>
+          )}
         </div>
         <div className="clip-row__actions">
           {!hasFrames && (
@@ -667,6 +802,27 @@ function ClipRow(props: {
               {hasNarration && busy !== "narrate" && (
                 <button onClick={toggleNarration} className="small">
                   {narrationExpanded ? "Hide script" : "View script"}
+                </button>
+              )}
+              {hasNarration && (
+                <button
+                  onClick={generateAudio}
+                  disabled={busy != null}
+                  className="small"
+                >
+                  {busy === "audio"
+                    ? ttsProgress
+                      ? ttsProgress.stage === "loading"
+                        ? "Loading TTS model…"
+                        : ttsProgress.stage === "loaded"
+                        ? "Generating audio…"
+                        : ttsProgress.stage === "progress"
+                        ? `Audio ${ttsProgress.index}/${ttsProgress.total}…`
+                        : "Finishing…"
+                      : "Starting…"
+                    : clip.status === "audio_ready" || clip.status === "rendered"
+                    ? "Re-generate audio"
+                    : "Generate audio"}
                 </button>
               )}
             </>
@@ -704,14 +860,14 @@ function ClipRow(props: {
           {liveEntries
             .filter((e) => e.text != null)
             .map((e) => (
-              <div key={e.name} className="narration-line">
-                <span className="narration-line__ts">
-                  {e.timestamp_seconds != null
-                    ? fmtDuration(e.timestamp_seconds)
-                    : `slide ${e.name.replace(/\.jpg$/i, "")}`}
-                </span>
-                <span className="narration-line__text">{e.text}</span>
-              </div>
+              <NarrationEditableLine
+                key={e.name}
+                entry={e}
+                projectDir={projectDir}
+                clipId={clip.id}
+                onChange={(updated) => setNarration(updated)}
+                onError={onError}
+              />
             ))}
           {busy === "narrate" && narrationProgress?.inherited && (
             <p className="hint">
@@ -721,6 +877,247 @@ function ClipRow(props: {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ---------- Editable narration line ---------- */
+
+function NarrationEditableLine(props: {
+  entry: NarrationEntry;
+  projectDir: string;
+  clipId: string;
+  onChange: (narration: Narration) => void;
+  onError: (msg: string) => void;
+}) {
+  const { entry, projectDir, clipId, onChange, onError } = props;
+  const [localText, setLocalText] = useState(entry.text ?? "");
+  const [saving, setSaving] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+  const lastEntryTextRef = useRef(entry.text ?? "");
+
+  // If the entry's text changes from outside (e.g. AI re-narrate), refresh
+  // our local copy unless the user is mid-edit. Detect "user is mid-edit"
+  // by checking if the local text differs from the LAST known prop value.
+  useEffect(() => {
+    const propText = entry.text ?? "";
+    const localMatchesLastProp = localText === lastEntryTextRef.current;
+    if (propText !== lastEntryTextRef.current && localMatchesLastProp) {
+      // Prop changed and user hadn't edited — sync.
+      setLocalText(propText);
+    }
+    lastEntryTextRef.current = propText;
+  }, [entry.text, localText]);
+
+  // Debounced save.
+  useEffect(() => {
+    const propText = entry.text ?? "";
+    if (localText === propText) return;
+    const t = setTimeout(async () => {
+      setSaving(true);
+      try {
+        const updated: Narration = await invoke("update_narration_entry", {
+          projectDir,
+          clipId,
+          frameName: entry.name,
+          newText: localText,
+        });
+        onChange(updated);
+      } catch (e: any) {
+        onError(e?.message || String(e));
+      } finally {
+        setSaving(false);
+      }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [localText, entry.text, entry.name, projectDir, clipId, onChange, onError]);
+
+  const regenerateAudio = async () => {
+    if (regenerating) return;
+    setRegenerating(true);
+    try {
+      await invoke("regenerate_entry_audio", {
+        projectDir,
+        clipId,
+        frameName: entry.name,
+      });
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  const isEdited = localText !== (entry.text ?? "") || saving;
+
+  return (
+    <div className="narration-line narration-line--editable">
+      <span className="narration-line__ts">
+        {entry.timestamp_seconds != null
+          ? fmtDuration(entry.timestamp_seconds)
+          : `slide ${entry.name.replace(/\.jpg$/i, "")}`}
+      </span>
+      <div className="narration-line__editor">
+        <textarea
+          className="narration-line__textarea"
+          value={localText}
+          onChange={(e) => setLocalText(e.target.value)}
+          rows={Math.max(2, Math.ceil(localText.length / 60))}
+          spellCheck
+        />
+        <div className="narration-line__actions">
+          <span className="narration-line__status">
+            {saving ? "Saving…" : isEdited ? "Unsaved" : ""}
+          </span>
+          <button
+            className="small"
+            onClick={regenerateAudio}
+            disabled={regenerating || saving || !localText.trim()}
+          >
+            {regenerating ? "Regenerating…" : "Regenerate audio"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Render section ---------- */
+
+function RenderSection(props: {
+  project: Project;
+  onError: (msg: string) => void;
+  onProjectChange: (p: Project) => void;
+}) {
+  const { project, onError, onProjectChange } = props;
+  const [rendering, setRendering] = useState(false);
+  const [progress, setProgress] = useState<RenderProgress | null>(null);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<RenderProgress>("render-progress", (event) => {
+        setProgress(event.payload);
+      });
+    })();
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  const readyClips = project.clips.filter(
+    (c) => c.status === "audio_ready" || c.status === "rendered",
+  );
+  const canRender = readyClips.length > 0;
+  const allRendered =
+    project.clips.length > 0 &&
+    project.clips.every((c) => c.status === "rendered");
+
+  const render = async () => {
+    if (rendering) return;
+    setRendering(true);
+    setProgress(null);
+    try {
+      await invoke("render_video", { projectDir: project.dir });
+      // Reload project so statuses flip to "rendered".
+      const updated: Project = await invoke("load_project", {
+        projectDir: project.dir,
+      });
+      onProjectChange(updated);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setRendering(false);
+    }
+  };
+
+  const openOutput = async () => {
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(`${project.dir}/output.mp4`);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  };
+
+  const revealOutput = async () => {
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(`${project.dir}/output.mp4`);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  };
+
+  return (
+    <div className="status-card">
+      <div className="status-label">Render</div>
+
+      {!canRender && (
+        <p className="muted">
+          Generate audio on at least one clip to enable rendering.
+        </p>
+      )}
+
+      {canRender && !rendering && !allRendered && (
+        <p className="muted">
+          {readyClips.length} of {project.clips.length} clips ready.
+          {readyClips.length < project.clips.length &&
+            " (Only clips with audio will be included.)"}
+        </p>
+      )}
+
+      {allRendered && !rendering && (
+        <p className="muted">
+          ✓ Video ready: <span className="mono">{project.dir}/output.mp4</span>
+        </p>
+      )}
+
+      {rendering && progress && (
+        <div className="render-progress">
+          <div className="render-progress__detail">
+            <span className="render-progress__stage">{progress.stage}</span>{" "}
+            {progress.detail}
+          </div>
+          <div className="render-progress__bar">
+            <div
+              className="render-progress__fill"
+              style={{
+                width:
+                  progress.fraction >= 0
+                    ? `${Math.round(progress.fraction * 100)}%`
+                    : "100%",
+                opacity: progress.fraction >= 0 ? 1 : 0.4,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      <div className="row row--end">
+        {allRendered && !rendering && (
+          <>
+            <button onClick={render} disabled={rendering} className="small">
+              Re-render
+            </button>
+            <button onClick={revealOutput} className="small">
+              Show in Finder
+            </button>
+            <button onClick={openOutput} className="primary">
+              ▶ Play output.mp4
+            </button>
+          </>
+        )}
+        {(!allRendered || rendering) && (
+          <button
+            className="primary"
+            onClick={render}
+            disabled={!canRender || rendering}
+          >
+            {rendering ? "Rendering…" : "Render video"}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
