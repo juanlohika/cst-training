@@ -4,15 +4,40 @@
 // project.json + a clips/ subdir. Each clip is a numbered subfolder with
 // the source file copied in. Frames/narration/audio land in clip folders
 // in later steps.
+//
+// Phase 1 step (b): frame extraction. ffmpeg samples 1 fps from videos,
+// soffice (LibreOffice) renders one JPG per slide for PPTX. Both write
+// into clips/<id>/frames/*.jpg.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const PROJECT_FILE: &str = "project.json";
 const CLIPS_DIR: &str = "clips";
+const FRAMES_DIR: &str = "frames";
 const PROJECT_SCHEMA_VERSION: u32 = 1;
+
+// Step (b) constraints. See conversation context for the rationale.
+const MAX_CLIP_SECONDS: f64 = 600.0; // 10 minutes
+const FRAMES_PER_SECOND: u32 = 1;
+const JPEG_QUALITY: u8 = 2; // ffmpeg -q:v scale (2 = ~q90, lower=better)
+
+// External tool paths. Currently hard-coded to brew + LibreOffice.app
+// locations on this Mac (Phase 1 is single-developer). Phase 3 will swap
+// these to Tauri sidecar binaries via a small lookup helper — keeping the
+// indirection so that swap stays a one-place change.
+fn ffmpeg_path() -> PathBuf {
+    PathBuf::from("/opt/homebrew/bin/ffmpeg")
+}
+fn ffprobe_path() -> PathBuf {
+    PathBuf::from("/opt/homebrew/bin/ffprobe")
+}
+fn soffice_path() -> PathBuf {
+    PathBuf::from("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+}
 
 #[tauri::command]
 fn ping() -> String {
@@ -240,6 +265,275 @@ fn reorder_clips(project_dir: String, ordered_ids: Vec<String>) -> Result<Projec
     Ok(project)
 }
 
+/// Information about a single extracted frame, returned to the UI for
+/// the collapsible thumbnail grid. Paths are absolute so the UI can use
+/// them with Tauri's convertFileSrc().
+#[derive(Serialize, Deserialize, Clone)]
+struct FrameInfo {
+    /// 1-based frame number, zero-padded to 4 digits ("0001" .. "0120").
+    name: String,
+    /// Absolute path to the JPG on disk.
+    path: String,
+    /// Seconds from the start of the clip — null for PPTX slides
+    /// (slides don't have a meaningful timestamp).
+    timestamp_seconds: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ExtractResult {
+    /// Updated project with the clip's status/duration refreshed.
+    project: Project,
+    /// Per-frame info for the clip we just extracted.
+    frames: Vec<FrameInfo>,
+}
+
+/// Extract frames (or slide images) for a single clip. For MP4/MOV: probe
+/// duration, refuse if > 10min, then sample 1 fps as JPEG. For PPTX: hand
+/// off to soffice. Both write into clips/<id>/frames/*.jpg. Updates the
+/// clip's status to `frames_extracted` and persists the project.
+///
+/// This is synchronous and may take 10-30s on a 2-min MP4. The UI shows
+/// a spinner while it runs (step b2 decision: blocking, not async).
+#[tauri::command(rename_all = "camelCase")]
+fn extract_frames(project_dir: String, clip_id: String) -> Result<ExtractResult, String> {
+    let mut project = load_project(project_dir.clone())?;
+    let clip_idx = project
+        .clips
+        .iter()
+        .position(|c| c.id == clip_id)
+        .ok_or_else(|| format!("No clip with id {clip_id}"))?;
+
+    // Find the source file inside the clip folder (we copied it in
+    // add_clip as "source.<ext>" — but the extension varies).
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    let source = find_clip_source(&clip_dir)?;
+    let frames_dir = clip_dir.join(FRAMES_DIR);
+
+    // Clean any previous extraction so re-running doesn't leave stale frames.
+    if frames_dir.exists() {
+        fs::remove_dir_all(&frames_dir)
+            .map_err(|e| format!("Cannot clear frames dir: {e}"))?;
+    }
+    fs::create_dir_all(&frames_dir)
+        .map_err(|e| format!("Cannot create frames dir: {e}"))?;
+
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let duration_seconds = match ext.as_str() {
+        "mp4" | "mov" => Some(extract_video_frames(&source, &frames_dir)?),
+        "pptx" => {
+            extract_pptx_slides(&source, &frames_dir)?;
+            None
+        }
+        other => return Err(format!("Unsupported source extension: {other}")),
+    };
+
+    let frames = collect_frame_info(&frames_dir, duration_seconds)?;
+    if frames.is_empty() {
+        return Err("No frames produced. Check that the source is a valid video/PPTX.".into());
+    }
+
+    let clip = &mut project.clips[clip_idx];
+    clip.duration_seconds = duration_seconds;
+    clip.status = ClipStatus::FramesExtracted;
+    write_project_file(&project)?;
+
+    Ok(ExtractResult { project, frames })
+}
+
+/// List frames for a clip that has already been extracted (clip.status
+/// >= FramesExtracted). Used by the UI when re-opening a project to
+/// re-populate the thumbnail grid without re-running ffmpeg.
+#[tauri::command(rename_all = "camelCase")]
+fn list_frames(project_dir: String, clip_id: String) -> Result<Vec<FrameInfo>, String> {
+    let project = load_project(project_dir.clone())?;
+    let clip = project
+        .clips
+        .iter()
+        .find(|c| c.id == clip_id)
+        .ok_or_else(|| format!("No clip with id {clip_id}"))?;
+    let frames_dir = Path::new(&project_dir)
+        .join(CLIPS_DIR)
+        .join(&clip_id)
+        .join(FRAMES_DIR);
+    if !frames_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    collect_frame_info(&frames_dir, clip.duration_seconds)
+}
+
+/// ffprobe the duration of a video file. Returns seconds as f64.
+fn probe_duration(source: &Path) -> Result<f64, String> {
+    let output = Command::new(ffprobe_path())
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(source)
+        .output()
+        .map_err(|e| format!("Cannot run ffprobe: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    s.parse::<f64>()
+        .map_err(|e| format!("ffprobe returned non-numeric duration '{s}': {e}"))
+}
+
+/// Sample frames from a video at FRAMES_PER_SECOND. Returns the duration.
+fn extract_video_frames(source: &Path, frames_dir: &Path) -> Result<f64, String> {
+    let duration = probe_duration(source)?;
+    if duration > MAX_CLIP_SECONDS {
+        return Err(format!(
+            "Clip is {:.1} min long; the 10-minute cap was set to keep AI processing tractable. \
+             Trim with QuickTime and re-add it.",
+            duration / 60.0
+        ));
+    }
+
+    let pattern = frames_dir.join("%04d.jpg");
+    let status = Command::new(ffmpeg_path())
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+        ])
+        .arg(source)
+        .args([
+            "-vf",
+            &format!("fps={FRAMES_PER_SECOND}"),
+            "-q:v",
+            &JPEG_QUALITY.to_string(),
+        ])
+        .arg(&pattern)
+        .status()
+        .map_err(|e| format!("Cannot run ffmpeg: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg exited with status {status}"));
+    }
+    Ok(duration)
+}
+
+/// Convert each PPTX slide to a JPG using LibreOffice headless. LibreOffice
+/// writes <source-stem>.jpg per slide automatically when --convert-to jpg
+/// is given a multi-slide deck; we then rename to NNNN.jpg for consistency.
+fn extract_pptx_slides(source: &Path, frames_dir: &Path) -> Result<(), String> {
+    // LibreOffice writes one file per slide, named <stem>.jpg, <stem>-2.jpg…
+    // We give it the frames_dir as outdir directly so the files land there.
+    let status = Command::new(soffice_path())
+        .args(["--headless", "--convert-to", "jpg", "--outdir"])
+        .arg(frames_dir)
+        .arg(source)
+        .status()
+        .map_err(|e| format!("Cannot run soffice: {e}"))?;
+    if !status.success() {
+        return Err(format!("soffice exited with status {status}"));
+    }
+
+    // Normalize names: LibreOffice produces "<stem>.jpg", "<stem>-2.jpg",
+    // "<stem>-3.jpg" etc. Rename to NNNN.jpg in slide order.
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "PPTX has no filename stem".to_string())?;
+    let mut produced: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(frames_dir).map_err(|e| format!("Cannot scan frames dir: {e}"))? {
+        let p = entry.map_err(|e| format!("Frame entry error: {e}"))?.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jpg") {
+            continue;
+        }
+        let base = name.trim_end_matches(".jpg");
+        let slide_n: u32 = if base == stem {
+            1
+        } else if let Some(suffix) = base.strip_prefix(&format!("{stem}-")) {
+            suffix.parse().unwrap_or(0)
+        } else {
+            continue;
+        };
+        if slide_n > 0 {
+            produced.push((slide_n, p));
+        }
+    }
+    produced.sort_by_key(|(n, _)| *n);
+    for (n, src) in &produced {
+        let dest = frames_dir.join(format!("{n:04}.jpg"));
+        if &dest != src {
+            fs::rename(src, &dest)
+                .map_err(|e| format!("Cannot rename slide {n}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk the frames dir and produce a sorted FrameInfo list. For video
+/// clips, timestamp_seconds is computed from the index (1 fps). For PPTX,
+/// timestamp is None — slides don't have timestamps.
+fn collect_frame_info(
+    frames_dir: &Path,
+    clip_duration_seconds: Option<f64>,
+) -> Result<Vec<FrameInfo>, String> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(frames_dir)
+        .map_err(|e| format!("Cannot scan frames dir: {e}"))?
+        .filter_map(|r| r.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+
+    let mut frames = Vec::with_capacity(entries.len());
+    for (i, path) in entries.into_iter().enumerate() {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let timestamp_seconds = clip_duration_seconds.map(|_| (i as f64) / (FRAMES_PER_SECOND as f64));
+        frames.push(FrameInfo {
+            name,
+            path: path.to_string_lossy().into_owned(),
+            timestamp_seconds,
+        });
+    }
+    Ok(frames)
+}
+
+/// Find the source.* file inside a clip dir (we copied it as "source.<ext>"
+/// in add_clip).
+fn find_clip_source(clip_dir: &Path) -> Result<PathBuf, String> {
+    for entry in fs::read_dir(clip_dir).map_err(|e| format!("Cannot scan clip dir: {e}"))? {
+        let p = entry.map_err(|e| format!("Clip entry error: {e}"))?.path();
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem == "source" && p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "No source.* file found in clip folder {}",
+        clip_dir.display()
+    ))
+}
+
 /// Helper: write project.json atomically-ish (tmp file + rename). Strips
 /// the `dir` field before writing — it's only meaningful at runtime and
 /// re-derived on load.
@@ -277,6 +571,8 @@ pub fn run() {
             add_clip,
             remove_clip,
             reorder_clips,
+            extract_frames,
+            list_frames,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { homeDir, downloadDir } from "@tauri-apps/api/path";
-import type { Project, Clip } from "./types";
+import type { Project, Clip, FrameInfo, ExtractResult } from "./types";
 import "./App.css";
 
 /**
@@ -351,7 +351,10 @@ function ProjectView(props: {
             key={clip.id}
             clip={clip}
             position={i + 1}
+            projectDir={project.dir}
+            onExtracted={(updated) => onProjectChange(updated)}
             onRemove={() => removeClip(clip.id)}
+            onError={onError}
           />
         ))}
       </div>
@@ -362,7 +365,7 @@ function ProjectView(props: {
           <li>✓ Tauri shell + bridge</li>
           <li>✓ Source file picker</li>
           <li>✓ Project model + clip list</li>
-          <li>○ Extract frames per clip (step b)</li>
+          <li>{project.clips.some((c) => c.status !== "draft") ? "✓" : "○"} Extract frames per clip (step b)</li>
           <li>○ AI vision narration per frame (step c)</li>
           <li>○ AI-generated titles (step d)</li>
           <li>○ TTS audio per clip (step e)</li>
@@ -375,26 +378,117 @@ function ProjectView(props: {
 
 /* ---------- Clip row ---------- */
 
-function ClipRow(props: { clip: Clip; position: number; onRemove: () => void }) {
-  const { clip, position, onRemove } = props;
+function ClipRow(props: {
+  clip: Clip;
+  position: number;
+  projectDir: string;
+  onExtracted: (project: Project) => void;
+  onRemove: () => void;
+  onError: (msg: string) => void;
+}) {
+  const { clip, position, projectDir, onExtracted, onRemove, onError } = props;
+  const [busy, setBusy] = useState(false);
+  const [frames, setFrames] = useState<FrameInfo[] | null>(null);
+  const [framesExpanded, setFramesExpanded] = useState(false);
+
+  // If the clip is already extracted (e.g. project just loaded from disk),
+  // fetch the frame list lazily once — only when the user expands the grid,
+  // so opening a project doesn't fan out a Rust call per clip.
+  const ensureFramesLoaded = useCallback(async () => {
+    if (frames !== null) return;
+    try {
+      const list: FrameInfo[] = await invoke("list_frames", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setFrames(list);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  }, [frames, projectDir, clip.id, onError]);
+
+  const extract = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result: ExtractResult = await invoke("extract_frames", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setFrames(result.frames);
+      setFramesExpanded(true);
+      onExtracted(result.project);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleFrames = async () => {
+    if (!framesExpanded) await ensureFramesLoaded();
+    setFramesExpanded((v) => !v);
+  };
+
+  const hasFrames = clip.status !== "draft";
+
   return (
-    <div className="clip-row">
-      <div className="clip-row__num">{String(position).padStart(2, "0")}</div>
-      <div className="clip-row__body">
-        <div className="clip-row__name">{clip.source_name}</div>
-        <div className="clip-row__meta">
-          {formatBytes(clip.bytes)}
-          {clip.duration_seconds != null && ` · ${fmtDuration(clip.duration_seconds)}`}
-          {" · "}
-          <span className={`status status--${clip.status}`}>
-            {clip.status.replace("_", " ")}
-          </span>
+    <div className="clip-row clip-row--block">
+      <div className="clip-row__head">
+        <div className="clip-row__num">{String(position).padStart(2, "0")}</div>
+        <div className="clip-row__body">
+          <div className="clip-row__name">{clip.source_name}</div>
+          <div className="clip-row__meta">
+            {formatBytes(clip.bytes)}
+            {clip.duration_seconds != null && ` · ${fmtDuration(clip.duration_seconds)}`}
+            {" · "}
+            <span className={`status status--${clip.status}`}>
+              {clip.status.replace("_", " ")}
+            </span>
+            {hasFrames && frames !== null && ` · ${frames.length} frames`}
+          </div>
+          {clip.title && <div className="clip-row__title">"{clip.title}"</div>}
         </div>
-        {clip.title && <div className="clip-row__title">"{clip.title}"</div>}
+        <div className="clip-row__actions">
+          {!hasFrames && (
+            <button onClick={extract} disabled={busy} className="small">
+              {busy ? "Extracting…" : "Extract frames"}
+            </button>
+          )}
+          {hasFrames && (
+            <>
+              <button onClick={toggleFrames} className="small">
+                {framesExpanded ? "Hide frames" : "View frames"}
+              </button>
+              <button onClick={extract} disabled={busy} className="small">
+                {busy ? "Re-extracting…" : "Re-extract"}
+              </button>
+            </>
+          )}
+          <button className="small danger" onClick={onRemove} disabled={busy}>
+            Remove
+          </button>
+        </div>
       </div>
-      <button className="small danger" onClick={onRemove}>
-        Remove
-      </button>
+
+      {framesExpanded && frames !== null && (
+        <div className="frames-grid">
+          {frames.map((f) => (
+            <figure key={f.name} className="thumb">
+              <img
+                src={convertFileSrc(f.path)}
+                alt={f.name}
+                loading="lazy"
+              />
+              <figcaption>
+                {f.timestamp_seconds != null
+                  ? fmtDuration(f.timestamp_seconds)
+                  : `slide ${f.name.replace(/\.jpg$/i, "")}`}
+              </figcaption>
+            </figure>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

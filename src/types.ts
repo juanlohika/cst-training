@@ -27,3 +27,14 @@ export interface Project {
   // We rely on it being present on every Project the UI holds.
   dir: string;
 }
+
+export interface FrameInfo {
+  name: string; // "0001.jpg"
+  path: string; // absolute path to the JPG on disk
+  timestamp_seconds: number | null; // null for PPTX slides
+}
+
+export interface ExtractResult {
+  project: Project;
+  frames: FrameInfo[];
+}
