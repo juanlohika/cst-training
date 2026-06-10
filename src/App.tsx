@@ -1,115 +1,417 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { homeDir, downloadDir } from "@tauri-apps/api/path";
+import type { Project, Clip } from "./types";
 import "./App.css";
 
 /**
  * CST Studio — desktop training video generator.
  *
- * Phase 1: walking skeleton. We're proving out each piece of the
- * pipeline one at a time. Right now: bridge + file-picker. Next:
- * Ollama vision → TTS → ffmpeg render.
+ * Phase 1 step (a): project model. The app is either on the landing screen
+ * (no project loaded) or in the project view (a Project object in memory,
+ * mirrored to project.json on disk). Steps (b)+ add frame extraction,
+ * vision, TTS, and rendering.
  */
 
-interface SourceInspection {
-  path: string;
-  file_name: string;
-  bytes: number;
-  kind: "pptx" | "video" | "unknown";
-}
+type AppState =
+  | { kind: "landing" }
+  | { kind: "creating" }
+  | { kind: "project"; project: Project };
 
 function App() {
-  const [bridge, setBridge] = useState<string>("Tauri bridge not pinged yet");
-  const [source, setSource] = useState<SourceInspection | null>(null);
+  const [state, setState] = useState<AppState>({ kind: "landing" });
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
 
-  const pingRust = async () => {
+  return (
+    <main className="container">
+      <header className="brand">
+        <h1>CST Studio</h1>
+        <p className="tagline">Desktop training video generator</p>
+      </header>
+
+      {error && <div className="error error--top">✗ {error}</div>}
+
+      {state.kind === "landing" && (
+        <Landing
+          onNewProject={() => setState({ kind: "creating" })}
+          onOpenProject={async () => {
+            setError(null);
+            try {
+              const dir = await open({ multiple: false, directory: true });
+              if (!dir) return;
+              const path = typeof dir === "string" ? dir : (dir as any).path;
+              const project: Project = await invoke("load_project", {
+                projectDir: path,
+              });
+              setState({ kind: "project", project });
+            } catch (e: any) {
+              setError(e?.message || String(e));
+            }
+          }}
+        />
+      )}
+
+      {state.kind === "creating" && (
+        <NewProjectModal
+          onCancel={() => setState({ kind: "landing" })}
+          onCreated={(project) => setState({ kind: "project", project })}
+          onError={setError}
+        />
+      )}
+
+      {state.kind === "project" && (
+        <ProjectView
+          project={state.project}
+          onProjectChange={(p) => setState({ kind: "project", project: p })}
+          onClose={() => setState({ kind: "landing" })}
+          onError={setError}
+        />
+      )}
+    </main>
+  );
+}
+
+/* ---------- Landing screen ---------- */
+
+function Landing(props: {
+  onNewProject: () => void;
+  onOpenProject: () => void;
+}) {
+  return (
+    <div className="status-card">
+      <div className="status-label">Get started</div>
+      <p className="muted">
+        Create a new project to start a training video, or open an existing
+        project folder.
+      </p>
+      <div className="row">
+        <button onClick={props.onNewProject}>New project</button>
+        <button onClick={props.onOpenProject}>Open project…</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- New project modal ---------- */
+
+function NewProjectModal(props: {
+  onCancel: () => void;
+  onCreated: (p: Project) => void;
+  onError: (msg: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [saveLocation, setSaveLocation] = useState<string>("");
+  const [creating, setCreating] = useState(false);
+
+  // Default to ~/Downloads on first render.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const dl = await downloadDir();
+        if (!cancelled) setSaveLocation(dl);
+      } catch {
+        try {
+          const home = await homeDir();
+          if (!cancelled) setSaveLocation(home);
+        } catch {
+          if (!cancelled) setSaveLocation("");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const create = async () => {
+    if (!name.trim() || !saveLocation || creating) return;
+    setCreating(true);
     try {
-      const result: string = await invoke("ping");
-      setBridge(`✓ ${result}`);
+      const project: Project = await invoke("create_project", {
+        parentDir: saveLocation,
+        name: name.trim(),
+      });
+      props.onCreated(project);
     } catch (e: any) {
-      setBridge(`✗ ${e?.message || String(e)}`);
+      props.onError(e?.message || String(e));
+    } finally {
+      setCreating(false);
     }
   };
 
-  const pickSource = async () => {
-    setError(null);
-    setBusy(true);
+  const chooseLocation = async () => {
+    const dir = await open({ multiple: false, directory: true });
+    if (!dir) return;
+    setSaveLocation(typeof dir === "string" ? dir : (dir as any).path);
+  };
+
+  return (
+    <div className="status-card">
+      <div className="status-label">New project</div>
+      <label className="field">
+        <span className="field-label">Project name</span>
+        <input
+          className="text-input"
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. AMII Operator Promo - June"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") create();
+          }}
+        />
+      </label>
+
+      <label className="field">
+        <span className="field-label">Save location</span>
+        <div className="row">
+          <input
+            className="text-input mono"
+            value={saveLocation}
+            onChange={(e) => setSaveLocation(e.target.value)}
+            spellCheck={false}
+          />
+          <button onClick={chooseLocation}>Choose…</button>
+        </div>
+        <span className="hint">
+          A folder will be created here named after the project.
+        </span>
+      </label>
+
+      <div className="row row--end">
+        <button onClick={props.onCancel} disabled={creating}>
+          Cancel
+        </button>
+        <button
+          className="primary"
+          onClick={create}
+          disabled={!name.trim() || !saveLocation || creating}
+        >
+          {creating ? "Creating…" : "Create"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Project view ---------- */
+
+function ProjectView(props: {
+  project: Project;
+  onProjectChange: (p: Project) => void;
+  onClose: () => void;
+  onError: (msg: string) => void;
+}) {
+  const { project, onProjectChange, onClose, onError } = props;
+
+  // Local working copy for text fields so typing isn't lagged by Rust IPC.
+  // We push to Rust on a debounced timer.
+  const [localName, setLocalName] = useState(project.name);
+  const [localOpening, setLocalOpening] = useState(project.opening_title_text);
+  const [localPrompt, setLocalPrompt] = useState(project.main_prompt);
+
+  // If the project prop changes (e.g. after add_clip), refresh the local
+  // text. We only do this when the project's identity (dir) changes — not
+  // when clips change — so the user's mid-edit text isn't clobbered.
+  const lastDirRef = useRef(project.dir);
+  useEffect(() => {
+    if (lastDirRef.current !== project.dir) {
+      lastDirRef.current = project.dir;
+      setLocalName(project.name);
+      setLocalOpening(project.opening_title_text);
+      setLocalPrompt(project.main_prompt);
+    }
+  }, [project.dir, project.name, project.opening_title_text, project.main_prompt]);
+
+  // Debounced autosave for text fields. 600ms after the last keystroke we
+  // push the whole project back to Rust. Conservative: we never lose work
+  // because the input controls remain controlled.
+  useEffect(() => {
+    const dirty =
+      localName !== project.name ||
+      localOpening !== project.opening_title_text ||
+      localPrompt !== project.main_prompt;
+    if (!dirty) return;
+    const t = setTimeout(async () => {
+      const next: Project = {
+        ...project,
+        name: localName,
+        opening_title_text: localOpening,
+        main_prompt: localPrompt,
+      };
+      try {
+        await invoke("save_project", { project: next });
+        onProjectChange(next);
+      } catch (e: any) {
+        onError(e?.message || String(e));
+      }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [localName, localOpening, localPrompt, project, onProjectChange, onError]);
+
+  const addClip = async () => {
     try {
       const selected = await open({
         multiple: false,
         directory: false,
         filters: [
-          { name: "Training source", extensions: ["pptx", "mp4", "mov"] },
+          { name: "Training source", extensions: ["mp4", "mov", "pptx"] },
         ],
       });
-      if (!selected) {
-        setBusy(false);
-        return;
-      }
+      if (!selected) return;
       const path = typeof selected === "string" ? selected : (selected as any).path;
-      const inspection: SourceInspection = await invoke("inspect_source", { path });
-      setSource(inspection);
+      const updated: Project = await invoke("add_clip", {
+        projectDir: project.dir,
+        sourcePath: path,
+      });
+      onProjectChange(updated);
     } catch (e: any) {
-      setError(e?.message || String(e));
-    } finally {
-      setBusy(false);
+      onError(e?.message || String(e));
     }
   };
 
+  const removeClip = useCallback(
+    async (clipId: string) => {
+      if (!confirm(`Remove clip ${clipId}? Its folder and contents will be deleted.`)) {
+        return;
+      }
+      try {
+        const updated: Project = await invoke("remove_clip", {
+          projectDir: project.dir,
+          clipId,
+        });
+        onProjectChange(updated);
+      } catch (e: any) {
+        onError(e?.message || String(e));
+      }
+    },
+    [project.dir, onProjectChange, onError],
+  );
+
   return (
-    <main className="container">
-      <div className="brand">
-        <h1>CST Studio</h1>
-        <p className="tagline">Desktop training video generator</p>
-      </div>
-
+    <>
       <div className="status-card">
-        <div className="status-label">Tauri ↔ Rust bridge</div>
-        <div className="status-value">{bridge}</div>
-        <button onClick={pingRust}>Ping Rust core</button>
-      </div>
-
-      <div className="status-card">
-        <div className="status-label">Pick a source file</div>
-        <div className="status-value">
-          {source
-            ? `${source.file_name} (${formatBytes(source.bytes)}, kind: ${source.kind})`
-            : "No file picked yet"}
+        <div className="row row--between">
+          <div className="status-label">Project</div>
+          <button className="small" onClick={onClose}>
+            Close project
+          </button>
         </div>
-        <button onClick={pickSource} disabled={busy}>
-          {busy ? "Opening…" : "Pick PPTX, MP4, or MOV"}
-        </button>
-        {source?.kind === "unknown" && (
-          <div className="warn">
-            ⚠ This file's extension isn't pptx/mp4/mov. We can read it but the pipeline may not know what to do with it.
-          </div>
+
+        <label className="field">
+          <span className="field-label">Name</span>
+          <input
+            className="text-input"
+            value={localName}
+            onChange={(e) => setLocalName(e.target.value)}
+          />
+        </label>
+
+        <label className="field">
+          <span className="field-label">Opening title (shown on the first card of the video)</span>
+          <input
+            className="text-input"
+            value={localOpening}
+            onChange={(e) => setLocalOpening(e.target.value)}
+            placeholder="Leave empty to skip the opening title card"
+          />
+        </label>
+
+        <label className="field">
+          <span className="field-label">Main prompt (context for the AI)</span>
+          <textarea
+            className="textarea"
+            value={localPrompt}
+            onChange={(e) => setLocalPrompt(e.target.value)}
+            placeholder="Describe what this training video is about and who it's for. The AI uses this to narrate each clip."
+            rows={4}
+          />
+        </label>
+
+        <div className="hint mono">{project.dir}</div>
+      </div>
+
+      <div className="status-card">
+        <div className="row row--between">
+          <div className="status-label">Clips ({project.clips.length})</div>
+          <button onClick={addClip}>Add clip…</button>
+        </div>
+
+        {project.clips.length === 0 && (
+          <p className="muted">
+            No clips yet. Add one MP4/MOV per section of the training video
+            (e.g. one for each step in the workflow).
+          </p>
         )}
-        {error && <div className="error">✗ {error}</div>}
+
+        {project.clips.map((clip, i) => (
+          <ClipRow
+            key={clip.id}
+            clip={clip}
+            position={i + 1}
+            onRemove={() => removeClip(clip.id)}
+          />
+        ))}
       </div>
 
       <div className="footer">
         Phase 1 milestones:
         <ul>
-          <li>✓ Tauri shell boots</li>
-          <li>✓ React UI renders</li>
-          <li>✓ Rust ↔ JS bridge</li>
-          <li>{source ? "✓" : "○"} Pick a source file from disk</li>
-          <li>○ Run Ollama Llama 3.2 Vision</li>
-          <li>○ Generate one TTS clip</li>
-          <li>○ Render one MP4 with ffmpeg</li>
+          <li>✓ Tauri shell + bridge</li>
+          <li>✓ Source file picker</li>
+          <li>✓ Project model + clip list</li>
+          <li>○ Extract frames per clip (step b)</li>
+          <li>○ AI vision narration per frame (step c)</li>
+          <li>○ AI-generated titles (step d)</li>
+          <li>○ TTS audio per clip (step e)</li>
+          <li>○ Render final MP4 with title cards + crossfades (step f)</li>
         </ul>
       </div>
-    </main>
+    </>
   );
 }
 
+/* ---------- Clip row ---------- */
+
+function ClipRow(props: { clip: Clip; position: number; onRemove: () => void }) {
+  const { clip, position, onRemove } = props;
+  return (
+    <div className="clip-row">
+      <div className="clip-row__num">{String(position).padStart(2, "0")}</div>
+      <div className="clip-row__body">
+        <div className="clip-row__name">{clip.source_name}</div>
+        <div className="clip-row__meta">
+          {formatBytes(clip.bytes)}
+          {clip.duration_seconds != null && ` · ${fmtDuration(clip.duration_seconds)}`}
+          {" · "}
+          <span className={`status status--${clip.status}`}>
+            {clip.status.replace("_", " ")}
+          </span>
+        </div>
+        {clip.title && <div className="clip-row__title">"{clip.title}"</div>}
+      </div>
+      <button className="small danger" onClick={onRemove}>
+        Remove
+      </button>
+    </div>
+  );
+}
+
+/* ---------- helpers ---------- */
+
 function formatBytes(n: number): string {
-  if (n < 1024) return `${n}B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)}GB`;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function fmtDuration(s: number): string {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
 export default App;

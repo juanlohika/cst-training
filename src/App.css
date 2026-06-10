@@ -20,9 +20,9 @@ body {
 }
 
 .container {
-  max-width: 720px;
+  max-width: 760px;
   margin: 0 auto;
-  padding: 60px 32px;
+  padding: 48px 32px 64px;
 }
 
 .brand h1 {
@@ -38,8 +38,10 @@ body {
   font-size: 14px;
 }
 
+/* ---------- Cards ---------- */
+
 .status-card {
-  margin-top: 32px;
+  margin-top: 24px;
   padding: 24px;
   border-radius: 12px;
   background: white;
@@ -55,12 +57,75 @@ body {
   margin-bottom: 8px;
 }
 
-.status-value {
-  font-size: 14px;
-  margin-bottom: 16px;
-  font-family: ui-monospace, Menlo, monospace;
-  color: #333;
+.muted {
+  color: #666;
+  margin: 0 0 12px 0;
 }
+
+.hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #888;
+}
+
+.mono {
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+/* ---------- Forms ---------- */
+
+.field {
+  display: block;
+  margin-top: 16px;
+}
+
+.field-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+.text-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  background: white;
+  color: #0f0f0f;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: #396cd8;
+  box-shadow: 0 0 0 3px rgba(57, 108, 216, 0.15);
+}
+
+.textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 8px;
+  font-size: 13px;
+  font-family: inherit;
+  background: white;
+  color: #0f0f0f;
+  resize: vertical;
+  min-height: 80px;
+}
+
+.textarea:focus {
+  outline: none;
+  border-color: #396cd8;
+  box-shadow: 0 0 0 3px rgba(57, 108, 216, 0.15);
+}
+
+/* ---------- Buttons ---------- */
 
 button {
   border-radius: 8px;
@@ -72,17 +137,144 @@ button {
   color: #0f0f0f;
   background-color: #fff;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: border-color 0.15s, background-color 0.15s;
 }
 
-button:hover {
+button:hover:not(:disabled) {
   border-color: #396cd8;
   background-color: #f8faff;
 }
 
-button:active {
+button:active:not(:disabled) {
   background-color: #e8e8e8;
 }
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: #396cd8;
+  color: white;
+  border-color: #396cd8;
+}
+
+button.primary:hover:not(:disabled) {
+  background: #2c5cc4;
+  border-color: #2c5cc4;
+}
+
+button.small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+button.danger {
+  color: #b71c1c;
+}
+
+button.danger:hover:not(:disabled) {
+  background: #ffebee;
+  border-color: #ef9a9a;
+}
+
+/* ---------- Layout helpers ---------- */
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.row--end {
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.row--between {
+  justify-content: space-between;
+  margin-top: 0;
+}
+
+/* ---------- Clip row ---------- */
+
+.clip-row {
+  display: grid;
+  grid-template-columns: 32px 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  margin-top: 8px;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.clip-row__num {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 13px;
+  color: #888;
+  font-weight: 700;
+}
+
+.clip-row__name {
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.clip-row__meta {
+  font-size: 11px;
+  color: #888;
+  margin-top: 2px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+.clip-row__title {
+  font-size: 12px;
+  color: #555;
+  margin-top: 4px;
+  font-style: italic;
+}
+
+.status {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.status--draft {
+  background: #eee;
+  color: #666;
+}
+
+.status--frames_extracted {
+  background: #e3f2fd;
+  color: #1565c0;
+}
+
+.status--narrated {
+  background: #ede7f6;
+  color: #4527a0;
+}
+
+.status--audio_ready {
+  background: #fff3e0;
+  color: #ef6c00;
+}
+
+.status--rendered {
+  background: #e8f5e9;
+  color: #2e7d32;
+}
+
+/* ---------- Warnings / errors ---------- */
 
 .warn {
   margin-top: 12px;
@@ -105,9 +297,12 @@ button:active {
   font-family: ui-monospace, Menlo, monospace;
 }
 
-.status-card + .status-card {
+.error--top {
   margin-top: 16px;
+  margin-bottom: 0;
 }
+
+/* ---------- Footer / phase milestones ---------- */
 
 .footer {
   margin-top: 32px;
@@ -127,6 +322,8 @@ button:active {
   font-size: 11px;
 }
 
+/* ---------- Dark mode ---------- */
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
@@ -138,8 +335,19 @@ button:active {
     border-color: #383838;
   }
 
-  .status-value {
-    color: #ddd;
+  .muted {
+    color: #aaa;
+  }
+
+  .hint {
+    color: #888;
+  }
+
+  .text-input,
+  .textarea {
+    background-color: #1f1f1f;
+    border-color: #444;
+    color: #f6f6f6;
   }
 
   button {
@@ -148,8 +356,32 @@ button:active {
     border-color: #444;
   }
 
-  button:hover {
+  button:hover:not(:disabled) {
     background-color: #333;
+    border-color: #5b8bf0;
+  }
+
+  button.primary {
+    background: #396cd8;
+    border-color: #396cd8;
+  }
+
+  button.danger {
+    color: #ff8a80;
+  }
+
+  button.danger:hover:not(:disabled) {
+    background: #3a1818;
+    border-color: #b71c1c;
+  }
+
+  .clip-row {
+    background: #1f1f1f;
+    border-color: #383838;
+  }
+
+  .clip-row__title {
+    color: #bbb;
   }
 
   .footer {
