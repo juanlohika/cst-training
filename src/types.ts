@@ -94,3 +94,27 @@ export interface RenderProgress {
   detail: string;
   fraction: number; // 0-1 or -1 for indeterminate
 }
+
+// Phase 1.7 — scan / plan / script types.
+export interface KeyFrame {
+  name: string; // "0007.jpg"
+  type: "section_divider" | "step";
+  summary: string;
+  title?: string | null;
+  ui_action?: string | null;
+  implicit_topic?: string | null;
+}
+
+export interface Scan {
+  version: number;
+  narrative_arc: string;
+  inferred_mode: "step_by_step" | "showcase" | "mixed";
+  key_frames: KeyFrame[];
+}
+
+export interface ScanProgress {
+  clip_id: string;
+  stage: "thumbnails" | "calling_ai" | "parsing" | "saving" | "done" | string;
+  detail: string;
+  fraction: number;
+}

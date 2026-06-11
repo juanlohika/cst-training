@@ -391,6 +391,543 @@ struct Narration {
     entries: Vec<NarrationEntry>,
 }
 
+// ============================================================================
+// Phase 1.7 — 3-pass scan → plan → script architecture.
+//
+// The old per-frame `narrate_clip` writes one narration per frame in
+// isolation, which produces redundant or out-of-context output for
+// multi-section clips. The new pipeline:
+//
+//   1. scan_clip   — AI looks at ALL thumbnails at once, returns per-frame
+//                    semantic summary + section-divider flags + filler
+//                    flags + UI actions + narrative arc + inferred mode.
+//                    Output: scan.json
+//   2. plan_script — AI consumes scan.json + main_prompt and produces a
+//                    multi-section plan: each section has a title +
+//                    overview + ordered script_units. Each unit can span
+//                    multiple frames and has a type (title_card,
+//                    section_title, instruction, filler). Also returns
+//                    Tier-1 clarification questions for the user.
+//                    Output: plan.json
+//   3. generate_audio_from_plan — one TTS WAV per non-filler unit.
+//   4. render — walks plan.json as chapters → final MP4.
+//
+// Old narrate_clip is kept for backwards compat with existing projects.
+// ============================================================================
+
+const SCAN_SCHEMA_VERSION: u32 = 1;
+const PLAN_SCHEMA_VERSION: u32 = 1;
+
+// (Constants from the abandoned batched-vision scan architecture were
+// removed when Phase 1.7 switched to OCR + small text LLM. See
+// feedback_cst_studio_ocr_hybrid_scan memory.)
+
+/// A "key frame" is one of the meaningful beats the AI identified —
+/// either a section divider (chapter intro slide) or a step that
+/// warrants its own narration line. Frames NOT in scan.key_frames are
+/// implicitly continuity / filler: they appear in the final video
+/// briefly while the previous key frame's audio plays.
+#[derive(Serialize, Deserialize, Clone)]
+struct KeyFrame {
+    /// Frame filename in the clip, e.g. "0007.jpg". Must match an
+    /// extracted frame on disk.
+    name: String,
+    /// "section_divider" | "step".
+    #[serde(rename = "type")]
+    kind: String,
+    /// One short sentence of what's happening here (input to plan stage).
+    summary: String,
+    /// For section_divider: the section title text on screen.
+    /// For step: null.
+    #[serde(default)]
+    title: Option<String>,
+    /// For step: what UI action is happening or about to happen,
+    /// e.g. "tap Menu icon top-left", "select Store ID from dropdown".
+    /// For section_divider: null.
+    #[serde(default)]
+    ui_action: Option<String>,
+    /// AI's grouping hint — short noun phrase. Plan stage uses this to
+    /// cluster steps into sections when section_dividers are sparse.
+    #[serde(default)]
+    implicit_topic: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Scan {
+    version: u32,
+    /// AI's one-paragraph summary of the whole clip's arc — used as
+    /// context when the plan stage writes per-section overviews.
+    narrative_arc: String,
+    /// AI's inferred mode for this clip: "step_by_step" | "showcase" | "mixed".
+    inferred_mode: String,
+    /// Only the FRAMES THAT MATTER. Order = frame-order in the clip.
+    /// All other frames are continuity filler that play silently or
+    /// alongside the previous key frame's narration.
+    key_frames: Vec<KeyFrame>,
+}
+
+#[derive(Clone, Serialize)]
+struct ScanProgress {
+    clip_id: String,
+    /// "thumbnails" → "calling_ai" → "parsing" → "saving" → "done".
+    stage: String,
+    detail: String,
+    /// 0–1, or -1 for indeterminate.
+    fraction: f64,
+}
+
+/// Phase 1.7 Pass 1: scan all of a clip's frames using **OCR + text LLM**,
+/// not vision LLM. See feedback_cst_studio_ocr_hybrid_scan memory for
+/// the rationale (vision LLMs proved too slow on 16GB Macs; OCR captures
+/// the on-screen labels we need and a small text LLM classifies cheaply).
+///
+/// Architecture (no batching, no vision):
+///
+///   1. Generate 320px thumbnails (cached).
+///   2. Compute pHash for each thumbnail.
+///   3. For each frame in order:
+///        a. If pHash matches the previous frame's hash within
+///           BATCH_BREAK_HAMMING_THRESHOLD - 5 → skip (continuation frame).
+///        b. Run Tesseract OCR on the thumbnail.
+///        c. If OCR text is empty AND it's not the first frame, treat as
+///           decorative/continuation, skip.
+///        d. Call OLLAMA_SCAN_MODEL (llama3.2:3b) with the OCR text +
+///           project context. Get back {label, summary}.
+///        e. Append to key_frames if label is A or B.
+///   4. After all per-frame classifications, do a single text-LLM call
+///      to write the narrative_arc + inferred_mode from the collected
+///      key_frame summaries (cheap, ~5s).
+///   5. Write final scan.json.
+///
+/// Progress events stream per-frame so the UI can show "12/75".
+#[tauri::command(rename_all = "camelCase")]
+async fn scan_clip(
+    app: tauri::AppHandle,
+    project_dir: String,
+    clip_id: String,
+) -> Result<Scan, String> {
+    use tauri::Emitter;
+
+    let project = load_project(project_dir.clone())?;
+    let clip = project
+        .clips
+        .iter()
+        .find(|c| c.id == clip_id)
+        .ok_or_else(|| format!("No clip with id {clip_id}"))?;
+    if clip.status == ClipStatus::Draft {
+        return Err("Extract frames first before scanning.".into());
+    }
+
+    let emit = |stage: &str, detail: &str, fraction: f64| {
+        let _ = app.emit(
+            "scan-progress",
+            ScanProgress {
+                clip_id: clip_id.clone(),
+                stage: stage.to_string(),
+                detail: detail.to_string(),
+                fraction,
+            },
+        );
+    };
+
+    // Step 1: ensure thumbnails exist (cached).
+    emit("thumbnails", "Generating thumbnails…", 0.02);
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    let thumbs_dir = clip_dir.join("thumbnails");
+    run_thumbnail_script(&clip_dir).await?;
+
+    let mut thumb_files: Vec<PathBuf> = fs::read_dir(&thumbs_dir)
+        .map_err(|e| format!("Cannot read thumbnails dir: {e}"))?
+        .filter_map(|r| r.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false)
+        })
+        .collect();
+    thumb_files.sort();
+    if thumb_files.is_empty() {
+        return Err("No thumbnails produced — re-extract frames first.".into());
+    }
+    let frame_names: Vec<String> = thumb_files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+        .collect();
+    let total = thumb_files.len();
+
+    // Step 2: pHash every frame to find near-duplicates.
+    emit("hashing", &format!("Hashing {total} thumbnails…"), 0.05);
+    let mut hashes: Vec<String> = Vec::with_capacity(total);
+    for path in &thumb_files {
+        let h = compute_phash(&path.to_string_lossy())
+            .map_err(|e| format!("Cannot hash {}: {e}", path.display()))?;
+        hashes.push(h);
+    }
+
+    // Step 3: per-frame OCR + classify loop.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
+
+    let mut key_frames: Vec<KeyFrame> = Vec::new();
+    let mut last_hash: Option<&str> = None;
+    let mut skipped_dup = 0;
+    let mut skipped_empty = 0;
+
+    for (i, (path, name)) in thumb_files.iter().zip(frame_names.iter()).enumerate() {
+        // 3a: skip near-duplicates of the immediately previous frame.
+        if let Some(prev) = last_hash {
+            let dist = hamming_distance(prev, &hashes[i]);
+            // We use a slightly tighter threshold than batch breaks because
+            // here we want to skip ONLY when frames are nearly identical
+            // (small dist = same screen); BATCH_BREAK was for "is this
+            // visually different enough to be a new section".
+            if dist <= 3 {
+                skipped_dup += 1;
+                last_hash = Some(&hashes[i]);
+                continue;
+            }
+        }
+        last_hash = Some(&hashes[i]);
+
+        emit(
+            "classify",
+            &format!("Frame {} of {total}", i + 1),
+            0.10 + 0.80 * (i as f64 / total as f64),
+        );
+
+        // 3b: OCR.
+        let ocr_text = run_tesseract(path).unwrap_or_default();
+        let ocr_clean = ocr_text.trim();
+
+        // 3c: skip if no text and not the first frame (decorative).
+        if ocr_clean.is_empty() && i > 0 {
+            skipped_empty += 1;
+            continue;
+        }
+
+        // 3d: classify via llama3.2:3b.
+        let snippet: String = ocr_clean.chars().take(400).collect::<String>()
+            .replace('\n', " / ");
+        let prompt = build_ocr_classify_prompt(&project.main_prompt, &snippet);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "label": { "type": "string", "enum": ["A", "B"] },
+                "summary": { "type": "string" }
+            },
+            "required": ["label", "summary"]
+        });
+        let body = serde_json::json!({
+            "model": OLLAMA_SCAN_MODEL,
+            "prompt": prompt,
+            "stream": false,
+            "format": schema,
+            "options": {
+                "num_predict": 100,
+                "temperature": 0.2,
+            }
+        });
+
+        let resp = match http
+            .post(OLLAMA_URL)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("scan_clip: HTTP error on {name}: {e} — skipping");
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            eprintln!("scan_clip: Ollama {status} on {name}: {txt} — skipping");
+            continue;
+        }
+        let json: serde_json::Value = match resp.json().await {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("scan_clip: JSON error on {name}: {e} — skipping");
+                continue;
+            }
+        };
+        let raw = json.get("response").and_then(|v| v.as_str()).unwrap_or("");
+        let cleaned = raw.trim();
+
+        #[derive(Deserialize)]
+        struct ClassifyResponse {
+            label: String,
+            summary: String,
+        }
+        let parsed: ClassifyResponse = match serde_json::from_str(cleaned) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("scan_clip: parse error on {name}: {e} | raw={cleaned} — skipping");
+                continue;
+            }
+        };
+
+        let kind = match parsed.label.trim().to_uppercase().as_str() {
+            "A" => "section_divider",
+            "B" => "step",
+            _ => "step",
+        }
+        .to_string();
+
+        // For section dividers, use the OCR snippet as the title hint.
+        // (Plan stage can clean it up; we just need a starting point.)
+        let title = if kind == "section_divider" {
+            Some(snippet.chars().take(80).collect::<String>())
+        } else {
+            None
+        };
+        // For steps, derive a brief ui_action from the summary itself.
+        let ui_action = if kind == "step" {
+            Some(parsed.summary.clone())
+        } else {
+            None
+        };
+
+        key_frames.push(KeyFrame {
+            name: name.clone(),
+            kind,
+            summary: parsed.summary,
+            title,
+            ui_action,
+            implicit_topic: None,
+        });
+    }
+
+    emit(
+        "merging",
+        &format!(
+            "Identified {} key frames ({} dup-skipped, {} empty-skipped) — writing arc…",
+            key_frames.len(),
+            skipped_dup,
+            skipped_empty
+        ),
+        0.92,
+    );
+
+    // Step 4: one text-only LLM call for narrative_arc + inferred_mode.
+    let (narrative_arc, inferred_mode) =
+        merge_ocr_scan_summary(&http, &project.main_prompt, &key_frames)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("scan_clip: merge pass failed ({e}) — using fallback values");
+                (
+                    "(narrative arc unavailable)".to_string(),
+                    "mixed".to_string(),
+                )
+            });
+
+    let scan = Scan {
+        version: SCAN_SCHEMA_VERSION,
+        narrative_arc,
+        inferred_mode,
+        key_frames,
+    };
+    write_scan_file(&clip_dir, &scan)?;
+    emit("done", "Done", 1.0);
+    Ok(scan)
+}
+
+/// Run Tesseract OCR on a thumbnail; return stdout text (may be empty).
+fn run_tesseract(image: &Path) -> Result<String, String> {
+    let output = Command::new(tesseract_path())
+        .arg(image)
+        .arg("-")
+        .output()
+        .map_err(|e| format!("Cannot run tesseract: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tesseract exited with status {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Per-frame OCR-classifier prompt for llama3.2:3b.
+fn build_ocr_classify_prompt(main_prompt: &str, ocr_text: &str) -> String {
+    let mut p = String::new();
+    p.push_str(
+        "You are classifying one frame from a training video by reading \
+         the on-screen text extracted via OCR.\n\n",
+    );
+    if !main_prompt.trim().is_empty() {
+        p.push_str("Project context: ");
+        p.push_str(main_prompt.trim());
+        p.push_str("\n\n");
+    }
+    p.push_str("OCR text from this frame:\n");
+    p.push_str("\"");
+    p.push_str(ocr_text);
+    p.push_str("\"\n\n");
+    p.push_str(
+        "Classify as ONE of:\n\
+         A = section divider / title slide (short 1-5 word title centered, intro of a new topic, NO form fields/buttons)\n\
+         B = action step (user is interacting with a UI screen with specific elements like form fields, dropdowns, button labels, list items)\n\
+         \n\
+         Reply with JSON only: {\"label\": \"A\" or \"B\", \"summary\": \"6-word summary of what is on screen or what user is doing\"}",
+    );
+    p
+}
+
+/// Merge pass: write narrative_arc + inferred_mode from collected key_frames.
+async fn merge_ocr_scan_summary(
+    http: &reqwest::Client,
+    main_prompt: &str,
+    key_frames: &[KeyFrame],
+) -> Result<(String, String), String> {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You just helped scan a training video. Given the key frames \
+         identified, produce a brief narrative arc summary and infer the \
+         overall mode.\n\n",
+    );
+    if !main_prompt.trim().is_empty() {
+        prompt.push_str("Project context: ");
+        prompt.push_str(main_prompt.trim());
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("Key frames in order:\n");
+    for kf in key_frames {
+        prompt.push_str("- ");
+        prompt.push_str(&kf.name);
+        prompt.push_str(" [");
+        prompt.push_str(&kf.kind);
+        prompt.push_str("]: ");
+        prompt.push_str(&kf.summary);
+        prompt.push_str("\n");
+    }
+    prompt.push_str(
+        "\nProduce JSON only:\n\
+         {\n  \"narrative_arc\": \"<<=60 word paragraph describing the whole clip’s story end-to-end>\",\n  \"inferred_mode\": \"step_by_step|showcase|mixed\"\n}\n",
+    );
+
+    let body = serde_json::json!({
+        "model": OLLAMA_SCAN_MODEL,
+        "prompt": prompt,
+        "stream": false,
+        "format": {
+            "type": "object",
+            "properties": {
+                "narrative_arc": { "type": "string" },
+                "inferred_mode": { "type": "string" }
+            },
+            "required": ["narrative_arc", "inferred_mode"]
+        },
+        "options": {
+            "num_predict": 250,
+            "temperature": 0.3,
+        }
+    });
+    let resp = http
+        .post(OLLAMA_URL)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Merge pass: cannot reach Ollama: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Merge pass returned {status}: {text}"));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Merge pass response not JSON: {e}"))?;
+    let raw = json
+        .get("response")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Merge pass missing response field".to_string())?;
+
+    #[derive(Deserialize)]
+    struct MergeResponse {
+        #[serde(default)]
+        narrative_arc: Option<String>,
+        #[serde(default)]
+        inferred_mode: Option<String>,
+    }
+    let parsed: MergeResponse = serde_json::from_str(raw.trim())
+        .map_err(|e| format!("Merge response invalid JSON: {e}"))?;
+    Ok((
+        parsed.narrative_arc.unwrap_or_else(|| "(no arc)".to_string()),
+        parsed.inferred_mode.unwrap_or_else(|| "mixed".to_string()),
+    ))
+}
+
+fn write_scan_file(clip_dir: &Path, scan: &Scan) -> Result<(), String> {
+    let path = clip_dir.join("scan.json");
+    let tmp = clip_dir.join("scan.json.tmp");
+    let pretty = serde_json::to_string_pretty(scan)
+        .map_err(|e| format!("Cannot serialize scan: {e}"))?;
+    fs::write(&tmp, pretty).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("Cannot finalize {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load scan.json for a clip if it exists. Used by the UI to populate
+/// the scan-preview panel without re-running the scan.
+#[tauri::command(rename_all = "camelCase")]
+fn load_scan(project_dir: String, clip_id: String) -> Result<Option<Scan>, String> {
+    let path = Path::new(&project_dir)
+        .join(CLIPS_DIR)
+        .join(&clip_id)
+        .join("scan.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let scan: Scan = serde_json::from_str(&raw)
+        .map_err(|e| format!("scan.json is invalid: {e}"))?;
+    Ok(Some(scan))
+}
+
+async fn run_thumbnail_script(clip_dir: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    let clip_dir_str = clip_dir.to_string_lossy().into_owned();
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let script = PathBuf::from(manifest)
+        .join("scripts")
+        .join("make_thumbnails.py");
+    if !script.exists() {
+        return Err(format!(
+            "Thumbnail script not found at {}",
+            script.display()
+        ));
+    }
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut child = std::process::Command::new(python_path())
+            .arg(&script)
+            .arg(&clip_dir_str)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Cannot spawn python: {e}"))?;
+        let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+        let reader = BufReader::new(stdout);
+        for _ in reader.lines().flatten() {}
+        let status = child
+            .wait()
+            .map_err(|e| format!("thumbnail wait: {e}"))?;
+        if !status.success() {
+            return Err(format!("thumbnail script exited {status}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thumbnail task panicked: {e}"))?
+}
+
 /// Extract frames (or slide images) for a single clip. For MP4/MOV: probe
 /// duration, refuse if > 10min, then sample 1 fps as JPEG. For PPTX: hand
 /// off to soffice. Both write into clips/<id>/frames/*.jpg. Updates the
@@ -2247,7 +2784,28 @@ const NARRATION_AUTOSAVE_EVERY: usize = 10;
 ///     (button labels, dates, list items) which is exactly what we need
 ///     for training-video voiceover.
 const OLLAMA_VISION_MODEL: &str = "minicpm-v:8b";
+/// Text-only classifier used by Phase 1.7's scan stage.
+///
+/// We do NOT use a vision model here. The scan pipeline reads each
+/// thumbnail with Tesseract OCR first, then feeds the extracted text
+/// (plus context) to this small text LLM for classification. Vision
+/// models proved too slow on 16GB Macs (5+ min per batch); OCR+text
+/// runs the full 75-frame scan in ~3-4 min and classifies more
+/// accurately because the model sees the real on-screen labels.
+///
+/// Why 3b specifically: llama3.2:1b is too small to distinguish a
+/// title slide from a form field. 3b correctly classifies both.
+///
+/// See feedback_cst_studio_ocr_hybrid_scan memory for the experiment log.
+const OLLAMA_SCAN_MODEL: &str = "llama3.2:3b";
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
+
+/// Path to the Tesseract OCR binary. Installed via `brew install tesseract`.
+/// Phase 3 sidecar bundling will swap to a bundled binary the same way
+/// ffmpeg_path/ffprobe_path/soffice_path do.
+fn tesseract_path() -> PathBuf {
+    PathBuf::from("/opt/homebrew/bin/tesseract")
+}
 
 /// Compute an 8x8 average-hash perceptual hash of a JPEG. Returns 16 hex
 /// chars (64 bits). Fast: ~3-5ms per frame on M1.
@@ -2820,6 +3378,8 @@ pub fn run() {
             generate_audio,
             load_audio_manifest,
             render_video,
+            scan_clip,
+            load_scan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

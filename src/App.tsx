@@ -13,6 +13,8 @@ import type {
   NarrationProgress,
   TtsProgress,
   RenderProgress,
+  Scan,
+  ScanProgress,
 } from "./types";
 import "./App.css";
 
@@ -517,6 +519,59 @@ function ClipRow(props: {
   const [localOverview, setLocalOverview] = useState(clip.overview ?? "");
   const [generatingOverview, setGeneratingOverview] = useState(false);
 
+  // Phase 1.7 — preview-only smart-scan state (temporary smoke-test UI;
+  // proper integration into a "Smart narrate" flow comes in 1.7h).
+  const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [scan, setScan] = useState<Scan | null>(null);
+  const [scanExpanded, setScanExpanded] = useState(false);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<ScanProgress>("scan-progress", (event) => {
+        if (event.payload.clip_id !== clip.id) return;
+        setScanProgress(event.payload);
+      });
+    })();
+    return () => {
+      unlisten?.();
+    };
+  }, [clip.id]);
+
+  // Auto-load any existing scan.json on first expand.
+  const ensureScanLoaded = async () => {
+    if (scan !== null) return;
+    try {
+      const result: Scan | null = await invoke("load_scan", {
+        projectDir,
+        clipId: clip.id,
+      });
+      if (result) setScan(result);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  };
+
+  const runSmartScan = async () => {
+    if (scanning) return;
+    setScanning(true);
+    setScanProgress(null);
+    try {
+      const result: Scan = await invoke("scan_clip", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setScan(result);
+      setScanExpanded(true);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setScanning(false);
+      setScanProgress(null);
+    }
+  };
+
   // Sync title + overview from props when the AI fills them in from outside.
   const lastTitleFromPropRef = useRef(clip.title);
   const lastOverviewFromPropRef = useRef(clip.overview ?? "");
@@ -785,6 +840,31 @@ function ClipRow(props: {
               <button onClick={extract} disabled={busy != null} className="small">
                 {busy === "extract" ? "Re-extracting…" : "Re-extract"}
               </button>
+              <button
+                onClick={runSmartScan}
+                disabled={busy != null || scanning}
+                className="small"
+                title="Phase 1.7 preview — AI looks at all thumbnails and picks the key frames."
+              >
+                {scanning
+                  ? scanProgress
+                    ? `Scanning… (${scanProgress.stage})`
+                    : "Scanning…"
+                  : scan
+                  ? "Re-scan"
+                  : "Smart scan (preview)"}
+              </button>
+              {scan && !scanning && (
+                <button
+                  onClick={async () => {
+                    if (!scanExpanded) await ensureScanLoaded();
+                    setScanExpanded((v) => !v);
+                  }}
+                  className="small"
+                >
+                  {scanExpanded ? "Hide scan" : "View scan"}
+                </button>
+              )}
               <button onClick={narrate} disabled={busy != null} className="small">
                 {busy === "narrate"
                   ? narrationProgress
@@ -875,6 +955,51 @@ function ClipRow(props: {
               reusing narration…
             </p>
           )}
+        </div>
+      )}
+
+      {scanning && scanProgress && (
+        <div className="scan-progress">
+          <span className="render-progress__stage">{scanProgress.stage}</span>{" "}
+          {scanProgress.detail}
+        </div>
+      )}
+
+      {scanExpanded && scan && (
+        <div className="scan-panel">
+          <div className="scan-panel__section">
+            <div className="scan-panel__label">Inferred mode</div>
+            <div className="scan-panel__mode">{scan.inferred_mode}</div>
+          </div>
+          <div className="scan-panel__section">
+            <div className="scan-panel__label">Narrative arc</div>
+            <div className="scan-panel__arc">{scan.narrative_arc}</div>
+          </div>
+          <div className="scan-panel__section">
+            <div className="scan-panel__label">
+              Key frames ({scan.key_frames.length})
+            </div>
+            {scan.key_frames.map((kf) => (
+              <div key={kf.name} className={`scan-keyframe scan-keyframe--${kf.type}`}>
+                <span className="scan-keyframe__name">{kf.name.replace(/\.jpg$/, "")}</span>
+                <span className={`scan-keyframe__type scan-keyframe__type--${kf.type}`}>
+                  {kf.type === "section_divider" ? "section" : "step"}
+                </span>
+                <div className="scan-keyframe__body">
+                  {kf.title && (
+                    <div className="scan-keyframe__title">"{kf.title}"</div>
+                  )}
+                  {kf.ui_action && (
+                    <div className="scan-keyframe__action">→ {kf.ui_action}</div>
+                  )}
+                  <div className="scan-keyframe__summary">{kf.summary}</div>
+                  {kf.implicit_topic && (
+                    <div className="scan-keyframe__topic">topic: {kf.implicit_topic}</div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

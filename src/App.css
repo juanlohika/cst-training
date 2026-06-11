@@ -397,6 +397,129 @@ button.danger:hover:not(:disabled) {
   transition: width 0.25s ease;
 }
 
+/* ---------- Phase 1.7 scan panel ---------- */
+
+.scan-progress {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #f0f4ff;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #2c5cc4;
+}
+
+.scan-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e5e5e5;
+}
+
+.scan-panel__section {
+  margin-bottom: 12px;
+}
+
+.scan-panel__label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin-bottom: 4px;
+}
+
+.scan-panel__mode {
+  display: inline-block;
+  padding: 2px 8px;
+  background: #044be4;
+  color: white;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.scan-panel__arc {
+  font-size: 13px;
+  color: #333;
+  line-height: 1.55;
+  font-style: italic;
+}
+
+.scan-keyframe {
+  display: grid;
+  grid-template-columns: 56px 70px 1fr;
+  gap: 12px;
+  padding: 8px;
+  margin-top: 4px;
+  border-radius: 6px;
+  align-items: start;
+}
+
+.scan-keyframe--section_divider {
+  background: #fff3e0;
+  border-left: 3px solid #ef6c00;
+}
+
+.scan-keyframe--step {
+  background: #f7f9ff;
+}
+
+.scan-keyframe__name {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: #555;
+}
+
+.scan-keyframe__type {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  height: fit-content;
+}
+
+.scan-keyframe__type--section_divider {
+  background: #ef6c00;
+  color: white;
+}
+
+.scan-keyframe__type--step {
+  background: #396cd8;
+  color: white;
+}
+
+.scan-keyframe__body {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.scan-keyframe__title {
+  font-weight: 600;
+  color: #6d4c00;
+  margin-bottom: 2px;
+}
+
+.scan-keyframe__action {
+  color: #2c5cc4;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.scan-keyframe__summary {
+  color: #333;
+}
+
+.scan-keyframe__topic {
+  font-size: 10px;
+  color: #888;
+  font-style: italic;
+  margin-top: 2px;
+}
+
 .clip-row__name {
   font-size: 13px;
   font-weight: 600;
