@@ -686,19 +686,17 @@ async fn scan_clip(
         } else {
             None
         };
-        // For steps, derive a brief ui_action from the summary itself.
-        let ui_action = if kind == "step" {
-            Some(parsed.summary.clone())
-        } else {
-            None
-        };
-
+        // ui_action is left None at the scan stage — the next stage
+        // (plan_script with minicpm-v) derives the actual imperative
+        // action from the summary + OCR text. Copying summary into
+        // ui_action made the UI look like duplicated text and added
+        // no real information.
         key_frames.push(KeyFrame {
             name: name.clone(),
             kind,
             summary: parsed.summary,
             title,
-            ui_action,
+            ui_action: None,
             implicit_topic: None,
         });
     }
@@ -758,7 +756,8 @@ fn build_ocr_classify_prompt(main_prompt: &str, ocr_text: &str) -> String {
     let mut p = String::new();
     p.push_str(
         "You are classifying one frame from a training video by reading \
-         the on-screen text extracted via OCR.\n\n",
+         the on-screen text extracted via OCR. Your output will be used \
+         to write a step-by-step training script later.\n\n",
     );
     if !main_prompt.trim().is_empty() {
         p.push_str("Project context: ");
@@ -766,15 +765,36 @@ fn build_ocr_classify_prompt(main_prompt: &str, ocr_text: &str) -> String {
         p.push_str("\n\n");
     }
     p.push_str("OCR text from this frame:\n");
-    p.push_str("\"");
+    p.push_str("\"\"\"\n");
     p.push_str(ocr_text);
-    p.push_str("\"\n\n");
+    p.push_str("\n\"\"\"\n\n");
     p.push_str(
-        "Classify as ONE of:\n\
-         A = section divider / title slide (short 1-5 word title centered, intro of a new topic, NO form fields/buttons)\n\
-         B = action step (user is interacting with a UI screen with specific elements like form fields, dropdowns, button labels, list items)\n\
+        "STEP 1 — Classify:\n\
+         A = section divider / title slide (short 1-5 word title centered, \
+            intro of a new topic, NO form fields or buttons visible)\n\
+         B = action step (UI screen with specific elements: form fields, \
+            dropdowns, button labels, list items, menu items)\n\
          \n\
-         Reply with JSON only: {\"label\": \"A\" or \"B\", \"summary\": \"6-word summary of what is on screen or what user is doing\"}",
+         STEP 2 — For your summary, you MUST:\n\
+         - Reference at least ONE specific UI element BY NAME from the OCR text above.\n\
+         - Use exact labels from the OCR (e.g. \"FF Store Surveyed\", \"Promo \
+            Implementation Form\", \"BPI\", \"China Bank\", \"Trade Presenter\", \
+            \"Refused to Sign Memo\") — do NOT genericize to \"UI element\" or \
+            \"form field\".\n\
+         - Write what the operator is doing or what is on screen, in 10-15 words.\n\
+         - When on-screen text is ALL CAPS, write it in Title Case in your summary.\n\
+         \n\
+         BAD examples (do NOT do this):\n\
+         - \"User interacts with UI screen elements\" (too generic)\n\
+         - \"User interacts with promo implementation form\" (no specific element)\n\
+         \n\
+         GOOD examples (DO this):\n\
+         - \"Operator opens the App Forms list, AMII Promo Implementation visible\"\n\
+         - \"Operator selects 1 in the FF Store Surveyed dropdown\"\n\
+         - \"Operator chooses Refused to Sign Memo as the non-implementation reason\"\n\
+         - \"Operator confirms the China Bank entry in the bank list\"\n\
+         \n\
+         Reply with JSON only: {\"label\": \"A\" or \"B\", \"summary\": \"...\"}",
     );
     p
 }
@@ -890,6 +910,407 @@ fn load_scan(project_dir: String, clip_id: String) -> Result<Option<Scan>, Strin
     let scan: Scan = serde_json::from_str(&raw)
         .map_err(|e| format!("scan.json is invalid: {e}"))?;
     Ok(Some(scan))
+}
+
+// ============================================================================
+// Phase 1.7c — plan_script
+// ============================================================================
+
+/// One narratable unit in the plan. Each unit has:
+///   - a stable id (so edits target the right thing across reloads)
+///   - a type (title_card / instruction / filler) that drives render
+///   - the frames it covers (multiple frames can share one unit's narration)
+///   - the text the narrator says (null for filler / title_card types)
+#[derive(Serialize, Deserialize, Clone)]
+struct ScriptUnit {
+    id: String,
+    /// "title_card" | "instruction" | "filler"
+    /// - title_card: shown silently as a section opener (overview is the audio)
+    /// - instruction: narrated step. Frames held while text is read aloud.
+    /// - filler: frames briefly shown, no audio.
+    #[serde(rename = "type")]
+    kind: String,
+    /// Ordered frame names (e.g. ["0007.jpg", "0008.jpg"]). Multiple frames
+    /// can share one narration when the action spans several frames.
+    frames: Vec<String>,
+    /// The narrator's line. None for filler/title_card units.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// One section of the training video — a chapter with its own title + intro.
+#[derive(Serialize, Deserialize, Clone)]
+struct PlanSection {
+    id: String,
+    /// On-screen section title (shown on the section title card).
+    title: String,
+    /// Narrator's intro paragraph for this section. Plays during the
+    /// section title card. Editable.
+    overview: String,
+    /// Ordered narration units. Walking this in order = the section's script.
+    units: Vec<ScriptUnit>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Plan {
+    version: u32,
+    /// Ordered sections; this is the chapter list of the final video.
+    sections: Vec<PlanSection>,
+    /// Frames the user explicitly excluded from the final video. They
+    /// stay on disk + still appear in scan.json, but render skips them.
+    /// This is the "delete a frame" feature.
+    #[serde(default)]
+    excluded_frames: Vec<String>,
+}
+
+/// Phase 1.7c: build a plan.json from scan.json + main_prompt + clip
+/// title/overview. Uses minicpm-v:8b (text-only — no images needed since
+/// the scan already extracted what each frame is about).
+///
+/// The plan groups scan's key_frames into sections. Each section gets:
+///   - A title (from the first section_divider in that section, OR derived)
+///   - An overview paragraph (AI-written from the section's frame summaries)
+///   - Ordered script_units (one per "step" key_frame, plus title_card units
+///     wrapping section_dividers)
+///
+/// Editable downstream via update_plan / toggle_frame_excluded.
+#[tauri::command(rename_all = "camelCase")]
+async fn plan_script(
+    project_dir: String,
+    clip_id: String,
+) -> Result<Plan, String> {
+    let project = load_project(project_dir.clone())?;
+    let clip = project
+        .clips
+        .iter()
+        .find(|c| c.id == clip_id)
+        .ok_or_else(|| format!("No clip with id {clip_id}"))?;
+
+    let scan = load_scan(project_dir.clone(), clip_id.clone())?
+        .ok_or_else(|| "Smart scan must be run first.".to_string())?;
+    if scan.key_frames.is_empty() {
+        return Err("Scan produced no key frames — nothing to plan.".into());
+    }
+
+    let prompt = build_plan_prompt(&project.main_prompt, &clip.title, &clip.overview, &scan);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
+
+    // Schema: AI produces section groupings only. We stamp the ids ourselves
+    // after parsing.
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "overview": { "type": "string" },
+                        "units": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "enum": ["title_card", "instruction", "filler"]
+                                    },
+                                    "frames": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    },
+                                    "text": { "type": "string" }
+                                },
+                                "required": ["type", "frames"]
+                            }
+                        }
+                    },
+                    "required": ["title", "overview", "units"]
+                }
+            }
+        },
+        "required": ["sections"]
+    });
+
+    let body = serde_json::json!({
+        "model": OLLAMA_VISION_MODEL, // minicpm-v:8b — text-only invocation
+        "prompt": prompt,
+        "stream": false,
+        "format": schema,
+        "options": {
+            // Plan output can be substantial: 4-8 sections * 3-6 units each.
+            // 2000 tokens covers a 20-section plan with room to spare.
+            "num_predict": 2000,
+            "temperature": 0.3,
+        }
+    });
+
+    let resp = http
+        .post(OLLAMA_URL)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Cannot reach Ollama at {OLLAMA_URL}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Ollama returned {status}: {text}"));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Ollama response not JSON: {e}"))?;
+    let raw = json
+        .get("response")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Ollama response missing 'response' field".to_string())?;
+
+    #[derive(Deserialize)]
+    struct PlanResponse {
+        sections: Vec<PlanSectionResponse>,
+    }
+    #[derive(Deserialize)]
+    struct PlanSectionResponse {
+        title: String,
+        overview: String,
+        units: Vec<UnitResponse>,
+    }
+    #[derive(Deserialize)]
+    struct UnitResponse {
+        #[serde(rename = "type")]
+        kind: String,
+        frames: Vec<String>,
+        #[serde(default)]
+        text: Option<String>,
+    }
+
+    let parsed: PlanResponse = serde_json::from_str(raw.trim()).map_err(|e| {
+        format!(
+            "Plan AI returned invalid JSON: {e}\nRaw (first 500 chars):\n{}",
+            &raw.chars().take(500).collect::<String>()
+        )
+    })?;
+
+    // Validate frame names against scan's key_frames; drop unknowns.
+    let valid_frames: std::collections::HashSet<&String> =
+        scan.key_frames.iter().map(|kf| &kf.name).collect();
+
+    let mut sections: Vec<PlanSection> = Vec::with_capacity(parsed.sections.len());
+    for (si, s) in parsed.sections.into_iter().enumerate() {
+        let mut units: Vec<ScriptUnit> = Vec::with_capacity(s.units.len());
+        for (ui, u) in s.units.into_iter().enumerate() {
+            let valid_unit_frames: Vec<String> = u
+                .frames
+                .into_iter()
+                .filter(|f| valid_frames.contains(f))
+                .collect();
+            if valid_unit_frames.is_empty() {
+                continue; // skip empty units
+            }
+            let kind = match u.kind.as_str() {
+                "title_card" | "instruction" | "filler" => u.kind,
+                _ => "instruction".to_string(),
+            };
+            // Filler + title_card never have text.
+            let text = if kind == "filler" || kind == "title_card" {
+                None
+            } else {
+                u.text.filter(|t| !t.trim().is_empty())
+            };
+            units.push(ScriptUnit {
+                id: format!("u{si:02}_{ui:02}"),
+                kind,
+                frames: valid_unit_frames,
+                text,
+            });
+        }
+        if units.is_empty() {
+            continue;
+        }
+        sections.push(PlanSection {
+            id: format!("s{si:02}"),
+            title: s.title.trim().to_string(),
+            overview: s.overview.trim().to_string(),
+            units,
+        });
+    }
+
+    if sections.is_empty() {
+        return Err("Plan AI produced no valid sections.".into());
+    }
+
+    let plan = Plan {
+        version: PLAN_SCHEMA_VERSION,
+        sections,
+        excluded_frames: Vec::new(),
+    };
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    write_plan_file(&clip_dir, &plan)?;
+    Ok(plan)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn load_plan(project_dir: String, clip_id: String) -> Result<Option<Plan>, String> {
+    let path = Path::new(&project_dir)
+        .join(CLIPS_DIR)
+        .join(&clip_id)
+        .join("plan.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let plan: Plan = serde_json::from_str(&raw)
+        .map_err(|e| format!("plan.json is invalid: {e}"))?;
+    Ok(Some(plan))
+}
+
+/// Save an edited plan back to disk. The UI calls this whenever the user
+/// edits a section title / overview / unit text / unit kind / frame
+/// membership / section order. Full-document replace — small file so it
+/// doesn't matter perf-wise.
+#[tauri::command(rename_all = "camelCase")]
+fn update_plan(project_dir: String, clip_id: String, plan: Plan) -> Result<(), String> {
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    write_plan_file(&clip_dir, &plan)
+}
+
+/// Toggle a frame's "excluded from final video" flag. The frame stays on
+/// disk + in scan.json + (potentially) referenced from script_units in
+/// plan.json — but render will skip it entirely. This is the "delete a
+/// frame I don't want" feature.
+#[tauri::command(rename_all = "camelCase")]
+fn toggle_frame_excluded(
+    project_dir: String,
+    clip_id: String,
+    frame_name: String,
+    excluded: bool,
+) -> Result<Plan, String> {
+    let mut plan = load_plan(project_dir.clone(), clip_id.clone())?
+        .ok_or_else(|| "No plan to update.".to_string())?;
+    if excluded {
+        if !plan.excluded_frames.contains(&frame_name) {
+            plan.excluded_frames.push(frame_name);
+        }
+    } else {
+        plan.excluded_frames.retain(|f| f != &frame_name);
+    }
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    write_plan_file(&clip_dir, &plan)?;
+    Ok(plan)
+}
+
+fn write_plan_file(clip_dir: &Path, plan: &Plan) -> Result<(), String> {
+    let path = clip_dir.join("plan.json");
+    let tmp = clip_dir.join("plan.json.tmp");
+    let pretty = serde_json::to_string_pretty(plan)
+        .map_err(|e| format!("Cannot serialize plan: {e}"))?;
+    fs::write(&tmp, pretty).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("Cannot finalize {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn build_plan_prompt(
+    main_prompt: &str,
+    clip_title: &str,
+    clip_overview: &str,
+    scan: &Scan,
+) -> String {
+    let mut p = String::new();
+    p.push_str(
+        "You are writing the script plan for a training video clip. You'll \
+         decide how to group the scanned key frames into sections, what each \
+         section should be titled, and what the narrator says for each step.\n\n",
+    );
+    if !main_prompt.trim().is_empty() {
+        p.push_str("PROJECT CONTEXT:\n");
+        p.push_str(main_prompt.trim());
+        p.push_str("\n\n");
+    }
+    if !clip_title.trim().is_empty() {
+        p.push_str("CLIP TITLE: ");
+        p.push_str(clip_title.trim());
+        p.push('\n');
+    }
+    if !clip_overview.trim().is_empty() {
+        p.push_str("CLIP OVERVIEW: ");
+        p.push_str(clip_overview.trim());
+        p.push_str("\n\n");
+    }
+    p.push_str("SCAN OUTPUT — narrative arc the scan stage produced:\n");
+    p.push_str(scan.narrative_arc.trim());
+    p.push_str("\n\n");
+
+    p.push_str(&format!(
+        "KEY FRAMES ({} total, in order):\n",
+        scan.key_frames.len()
+    ));
+    for kf in &scan.key_frames {
+        p.push_str("- ");
+        p.push_str(&kf.name);
+        p.push_str(" [");
+        p.push_str(&kf.kind);
+        p.push_str("]: ");
+        p.push_str(kf.summary.trim());
+        if let Some(t) = &kf.title {
+            p.push_str(" (title hint: \"");
+            p.push_str(t.trim());
+            p.push_str("\")");
+        }
+        p.push('\n');
+    }
+
+    p.push_str(
+        "\nYOUR JOB:\n\
+         1. Group the key frames into SECTIONS. Use section_divider frames \
+            as natural chapter breaks. If there are no section_divider \
+            frames or only one, infer sections from topic shifts.\n\
+         2. For each section: give it a short title (3-6 words), and write \
+            a 2-3 sentence overview that the narrator says to introduce it.\n\
+         3. Within each section, write ordered SCRIPT UNITS:\n\
+            - type=\"title_card\": ONE per section, wraps the section_divider \
+              frame(s) if any. No text — the section overview is the audio.\n\
+            - type=\"instruction\": narrated step. Each instruction unit \
+              has a 'text' field with the imperative-voice narration line. \
+              Multiple frames can share one instruction unit when the action \
+              spans several frames (e.g. typing into a field across 3 frames).\n\
+            - type=\"filler\": frames briefly shown with no narration (e.g. \
+              transition frames, near-duplicates). No text needed.\n\
+         4. NARRATION STYLE — REQUIRED:\n\
+            - Imperative voice — address the viewer directly. Start with a \
+              verb (Select, Tap, Open, Enter, Confirm, Choose, Scroll).\n\
+            - Reference SPECIFIC UI elements by name (use the labels from \
+              the scan summaries).\n\
+            - DON'T repeat the app name or form name every step — that's \
+              already covered in the overview.\n\
+            - DON'T use \"the user\" / \"the operator\" — speak TO the viewer.\n\
+            - When on-screen text is ALL CAPS, write it in Title Case.\n\
+            - 10-20 words per instruction line.\n\
+         5. RULES:\n\
+            - Every frame from the input list MUST appear in exactly one \
+              unit (don't drop frames; use 'filler' if no narration needed).\n\
+            - Frame names MUST match exactly (e.g. \"0007.jpg\").\n\
+            - Number of sections is your call — usually 2-6 for a typical \
+              training clip.\n\
+         \n\
+         GOOD example narration lines:\n\
+         - \"Tap App Forms from the menu, then select Promo Implementation Form.\"\n\
+         - \"Choose 1 in the FF Store Surveyed dropdown if you visited the store.\"\n\
+         - \"Confirm by tapping Submit at the bottom of the form.\"\n\
+         \n\
+         BAD examples to AVOID:\n\
+         - \"The user is selecting...\" (observer voice)\n\
+         - \"This screen shows the form\" (describes instead of instructs)\n\
+         - \"In Tarkie App's Promo Implementation Form, tap the field\" (repeats context)\n\
+         \n\
+         Respond with JSON only, matching the schema. No code fences, no preamble.",
+    );
+    p
 }
 
 async fn run_thumbnail_script(clip_dir: &Path) -> Result<(), String> {
@@ -3380,6 +3801,10 @@ pub fn run() {
             render_video,
             scan_clip,
             load_scan,
+            plan_script,
+            load_plan,
+            update_plan,
+            toggle_frame_excluded,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

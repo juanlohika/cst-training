@@ -15,6 +15,10 @@ import type {
   RenderProgress,
   Scan,
   ScanProgress,
+  Plan,
+  PlanSection,
+  ScriptUnit,
+  ScriptUnitKind,
 } from "./types";
 import "./App.css";
 
@@ -572,6 +576,71 @@ function ClipRow(props: {
     }
   };
 
+  // Phase 1.7c — plan state.
+  const [planning, setPlanning] = useState(false);
+  const [plan, setPlan] = useState<Plan | null>(null);
+  const [planExpanded, setPlanExpanded] = useState(false);
+
+  const ensurePlanLoaded = async () => {
+    if (plan !== null) return;
+    try {
+      const result: Plan | null = await invoke("load_plan", {
+        projectDir,
+        clipId: clip.id,
+      });
+      if (result) setPlan(result);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  };
+
+  const runPlanScript = async () => {
+    if (planning) return;
+    setPlanning(true);
+    try {
+      const result: Plan = await invoke("plan_script", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setPlan(result);
+      setPlanExpanded(true);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setPlanning(false);
+    }
+  };
+
+  // Persist plan edits to disk (debounced caller invokes this).
+  const savePlan = useCallback(
+    async (next: Plan) => {
+      try {
+        await invoke("update_plan", {
+          projectDir,
+          clipId: clip.id,
+          plan: next,
+        });
+      } catch (e: any) {
+        onError(e?.message || String(e));
+      }
+    },
+    [projectDir, clip.id, onError],
+  );
+
+  const toggleFrameExcluded = async (frameName: string, excluded: boolean) => {
+    try {
+      const result: Plan = await invoke("toggle_frame_excluded", {
+        projectDir,
+        clipId: clip.id,
+        frameName,
+        excluded,
+      });
+      setPlan(result);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  };
+
   // Sync title + overview from props when the AI fills them in from outside.
   const lastTitleFromPropRef = useRef(clip.title);
   const lastOverviewFromPropRef = useRef(clip.overview ?? "");
@@ -865,6 +934,27 @@ function ClipRow(props: {
                   {scanExpanded ? "Hide scan" : "View scan"}
                 </button>
               )}
+              {scan && !scanning && (
+                <button
+                  onClick={runPlanScript}
+                  disabled={busy != null || planning}
+                  className="small"
+                  title="Phase 1.7c — turn the scan into a per-section script plan (editable)."
+                >
+                  {planning ? "Planning…" : plan ? "Re-plan" : "Plan script"}
+                </button>
+              )}
+              {plan && !planning && (
+                <button
+                  onClick={async () => {
+                    if (!planExpanded) await ensurePlanLoaded();
+                    setPlanExpanded((v) => !v);
+                  }}
+                  className="small"
+                >
+                  {planExpanded ? "Hide plan" : "View plan"}
+                </button>
+              )}
               <button onClick={narrate} disabled={busy != null} className="small">
                 {busy === "narrate"
                   ? narrationProgress
@@ -998,6 +1088,208 @@ function ClipRow(props: {
                   )}
                 </div>
               </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {planExpanded && plan && (
+        <PlanEditor
+          plan={plan}
+          onChange={(p) => {
+            setPlan(p);
+            savePlan(p);
+          }}
+          onToggleExcluded={toggleFrameExcluded}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------- Plan editor ---------- */
+
+function PlanEditor(props: {
+  plan: Plan;
+  onChange: (plan: Plan) => void;
+  onToggleExcluded: (frameName: string, excluded: boolean) => void;
+}) {
+  const { plan, onChange, onToggleExcluded } = props;
+
+  // Collect all frames referenced by units so we can show a clean
+  // "excluded frames" UI alongside them.
+  const allFrames = plan.sections.flatMap((s) =>
+    s.units.flatMap((u) => u.frames),
+  );
+  const isExcluded = (frameName: string) =>
+    plan.excluded_frames.includes(frameName);
+
+  const updateSection = (sectionId: string, patch: Partial<PlanSection>) => {
+    const next = {
+      ...plan,
+      sections: plan.sections.map((s) =>
+        s.id === sectionId ? { ...s, ...patch } : s,
+      ),
+    };
+    onChange(next);
+  };
+
+  const updateUnit = (
+    sectionId: string,
+    unitId: string,
+    patch: Partial<ScriptUnit>,
+  ) => {
+    const next = {
+      ...plan,
+      sections: plan.sections.map((s) =>
+        s.id === sectionId
+          ? {
+              ...s,
+              units: s.units.map((u) =>
+                u.id === unitId ? { ...u, ...patch } : u,
+              ),
+            }
+          : s,
+      ),
+    };
+    onChange(next);
+  };
+
+  return (
+    <div className="plan-editor">
+      <div className="plan-editor__header">
+        <div className="status-label">Script plan ({plan.sections.length} section{plan.sections.length === 1 ? "" : "s"})</div>
+        {plan.excluded_frames.length > 0 && (
+          <span className="plan-editor__excluded-count">
+            {plan.excluded_frames.length} frame
+            {plan.excluded_frames.length === 1 ? "" : "s"} excluded
+          </span>
+        )}
+      </div>
+      <p className="hint">
+        Every text field below autosaves on edit. Exclude a frame to drop it
+        from the final video (it stays on disk).
+      </p>
+
+      {plan.sections.map((section, si) => (
+        <div key={section.id} className="plan-section">
+          <div className="plan-section__head">
+            <span className="plan-section__num">{(si + 1).toString().padStart(2, "0")}</span>
+            <div className="plan-section__body">
+              <label className="field">
+                <span className="field-label">Section title</span>
+                <input
+                  className="text-input"
+                  value={section.title}
+                  onChange={(e) =>
+                    updateSection(section.id, { title: e.target.value })
+                  }
+                  placeholder="Section title…"
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">
+                  Section overview (narrator's intro for this section)
+                </span>
+                <textarea
+                  className="textarea"
+                  value={section.overview}
+                  onChange={(e) =>
+                    updateSection(section.id, { overview: e.target.value })
+                  }
+                  rows={3}
+                  placeholder="The narrator says this when the section begins…"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="plan-units">
+            {section.units.map((unit) => (
+              <div
+                key={unit.id}
+                className={`plan-unit plan-unit--${unit.type}`}
+              >
+                <div className="plan-unit__head">
+                  <select
+                    className="plan-unit__type"
+                    value={unit.type}
+                    onChange={(e) =>
+                      updateUnit(section.id, unit.id, {
+                        type: e.target.value as ScriptUnitKind,
+                        // If switching to filler/title_card, clear text
+                        text:
+                          e.target.value === "filler" ||
+                          e.target.value === "title_card"
+                            ? null
+                            : unit.text,
+                      })
+                    }
+                  >
+                    <option value="instruction">Instruction</option>
+                    <option value="title_card">Title card</option>
+                    <option value="filler">Filler</option>
+                  </select>
+                  <div className="plan-unit__frames">
+                    {unit.frames.map((f) => (
+                      <button
+                        key={f}
+                        className={`plan-frame-chip ${
+                          isExcluded(f) ? "plan-frame-chip--excluded" : ""
+                        }`}
+                        onClick={() => onToggleExcluded(f, !isExcluded(f))}
+                        title={
+                          isExcluded(f)
+                            ? "Excluded — click to include"
+                            : "Click to exclude this frame from the final video"
+                        }
+                      >
+                        {f.replace(/\.jpg$/, "")}
+                        {isExcluded(f) && " ✕"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {unit.type === "instruction" && (
+                  <textarea
+                    className="plan-unit__text"
+                    value={unit.text ?? ""}
+                    onChange={(e) =>
+                      updateUnit(section.id, unit.id, { text: e.target.value })
+                    }
+                    rows={2}
+                    placeholder="What the narrator says for these frames…"
+                  />
+                )}
+                {unit.type === "title_card" && (
+                  <div className="plan-unit__hint">
+                    Silent title card. Audio comes from this section's overview.
+                  </div>
+                )}
+                {unit.type === "filler" && (
+                  <div className="plan-unit__hint">
+                    Filler — frames briefly shown, no narration.
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {allFrames.length > 0 && plan.excluded_frames.length > 0 && (
+        <div className="plan-editor__excluded">
+          <div className="status-label">Excluded frames</div>
+          <div className="plan-editor__excluded-list">
+            {plan.excluded_frames.map((f) => (
+              <button
+                key={f}
+                className="plan-frame-chip plan-frame-chip--excluded"
+                onClick={() => onToggleExcluded(f, false)}
+                title="Click to include this frame in the final video"
+              >
+                {f.replace(/\.jpg$/, "")} ✕
+              </button>
             ))}
           </div>
         </div>

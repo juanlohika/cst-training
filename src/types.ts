@@ -118,3 +118,26 @@ export interface ScanProgress {
   detail: string;
   fraction: number;
 }
+
+// Phase 1.7c — plan
+export type ScriptUnitKind = "title_card" | "instruction" | "filler";
+
+export interface ScriptUnit {
+  id: string;
+  type: ScriptUnitKind;
+  frames: string[];
+  text?: string | null;
+}
+
+export interface PlanSection {
+  id: string;
+  title: string;
+  overview: string;
+  units: ScriptUnit[];
+}
+
+export interface Plan {
+  version: number;
+  sections: PlanSection[];
+  excluded_frames: string[];
+}
