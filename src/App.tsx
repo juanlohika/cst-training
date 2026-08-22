@@ -19,6 +19,8 @@ import type {
   PlanSection,
   ScriptUnit,
   ScriptUnitKind,
+  ScriptPreview,
+  ScriptPreviewItem,
 } from "./types";
 import "./App.css";
 
@@ -580,6 +582,21 @@ function ClipRow(props: {
   const [planning, setPlanning] = useState(false);
   const [plan, setPlan] = useState<Plan | null>(null);
   const [planExpanded, setPlanExpanded] = useState(false);
+  // Phase 1.7g — script preview (what the render will actually produce).
+  const [scriptPreview, setScriptPreview] = useState<ScriptPreview | null>(null);
+  const [previewExpanded, setPreviewExpanded] = useState(false);
+
+  const refreshScriptPreview = useCallback(async () => {
+    try {
+      const result: ScriptPreview = await invoke("preview_plan_script", {
+        projectDir,
+        clipId: clip.id,
+      });
+      setScriptPreview(result);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  }, [projectDir, clip.id, onError]);
 
   const ensurePlanLoaded = async () => {
     if (plan !== null) return;
@@ -728,6 +745,20 @@ function ClipRow(props: {
     };
   }, [clip.id]);
 
+  // Phase 1.7f — listen for plan-driven TTS progress on the parallel event.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<TtsProgress>("plan-tts-progress", (event) => {
+        if (event.payload.clip_id !== clip.id) return;
+        setTtsProgress(event.payload);
+      });
+    })();
+    return () => {
+      unlisten?.();
+    };
+  }, [clip.id]);
+
   const ensureFramesLoaded = useCallback(async () => {
     if (frames !== null) return;
     try {
@@ -819,6 +850,23 @@ function ClipRow(props: {
       // Status flipped server-side. Reload project so UI reflects audio_ready.
       const updated: Project = await invoke("load_project", { projectDir });
       onNarrated(updated); // reuse the same prop — it just re-applies the project
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setBusy(null);
+      setTtsProgress(null);
+    }
+  };
+
+  // Phase 1.7f — generate one WAV per plan unit (and per section overview).
+  const generateAudioFromPlan = async () => {
+    if (busy) return;
+    setBusy("planAudio");
+    setTtsProgress(null);
+    try {
+      await invoke("generate_audio_from_plan", { projectDir, clipId: clip.id });
+      const updated: Project = await invoke("load_project", { projectDir });
+      onNarrated(updated);
     } catch (e: any) {
       onError(e?.message || String(e));
     } finally {
@@ -995,6 +1043,26 @@ function ClipRow(props: {
                     : "Generate audio"}
                 </button>
               )}
+              {plan && (
+                <button
+                  onClick={generateAudioFromPlan}
+                  disabled={busy != null}
+                  className="small"
+                  title="Generate one WAV per plan unit (and per section overview)."
+                >
+                  {busy === "planAudio"
+                    ? ttsProgress
+                      ? ttsProgress.stage === "loading"
+                        ? "Loading TTS model…"
+                        : ttsProgress.stage === "loaded"
+                        ? "Generating plan audio…"
+                        : ttsProgress.stage === "progress"
+                        ? `Plan audio ${ttsProgress.index}/${ttsProgress.total}…`
+                        : "Finishing…"
+                      : "Starting…"
+                    : "Generate audio from plan"}
+                </button>
+              )}
             </>
           )}
           <button className="small danger" onClick={onRemove} disabled={busy != null}>
@@ -1096,12 +1164,121 @@ function ClipRow(props: {
       {planExpanded && plan && (
         <PlanEditor
           plan={plan}
+          scan={scan}
           onChange={(p) => {
             setPlan(p);
             savePlan(p);
           }}
           onToggleExcluded={toggleFrameExcluded}
         />
+      )}
+
+      {/* Phase 1.7g — Script preview. Shows the exact playback sequence
+          (visible captions + actual audio text side by side) so the user
+          can verify the video before rendering. */}
+      {plan && (
+        <div className="script-preview">
+          <div className="row">
+            <button
+              className="small"
+              onClick={async () => {
+                if (!previewExpanded) await refreshScriptPreview();
+                setPreviewExpanded((v) => !v);
+              }}
+            >
+              {previewExpanded
+                ? "Hide script preview"
+                : "Show script preview"}
+            </button>
+            {previewExpanded && (
+              <button className="small" onClick={refreshScriptPreview}>
+                Refresh
+              </button>
+            )}
+          </div>
+          {previewExpanded && scriptPreview && (
+            <>
+              {(scriptPreview.stale_count > 0 ||
+                scriptPreview.missing_audio_count > 0) && (
+                <p className="script-preview__warn">
+                  ⚠ Audio is out of sync with the script.{" "}
+                  {scriptPreview.stale_count > 0 && (
+                    <>
+                      {scriptPreview.stale_count} edited unit
+                      {scriptPreview.stale_count === 1 ? "" : "s"} still
+                      play old audio.{" "}
+                    </>
+                  )}
+                  {scriptPreview.missing_audio_count > 0 && (
+                    <>
+                      {scriptPreview.missing_audio_count} unit
+                      {scriptPreview.missing_audio_count === 1 ? "" : "s"} have
+                      no audio yet.{" "}
+                    </>
+                  )}
+                  Click "Generate audio from plan" again before rendering.
+                </p>
+              )}
+              {scriptPreview.stale_count === 0 &&
+                scriptPreview.missing_audio_count === 0 &&
+                scriptPreview.items.length > 0 && (
+                  <p className="script-preview__ok">
+                    ✓ Script and audio are in sync ({scriptPreview.items.length}{" "}
+                    playback step
+                    {scriptPreview.items.length === 1 ? "" : "s"}).
+                  </p>
+                )}
+              <ol className="script-preview__list">
+                {scriptPreview.items.map((it, i) => (
+                  <li
+                    key={`${it.kind}-${it.unit_id}-${i}`}
+                    className={
+                      "script-preview__item " +
+                      (it.kind === "section_title"
+                        ? "script-preview__item--section "
+                        : "") +
+                      (it.stale ? "script-preview__item--stale " : "")
+                    }
+                  >
+                    <div className="script-preview__head">
+                      <span className="script-preview__kind">
+                        {it.kind === "section_title"
+                          ? "SECTION"
+                          : it.kind === "instruction"
+                          ? "STEP"
+                          : it.kind.toUpperCase()}
+                      </span>
+                      {it.frame && (
+                        <span className="script-preview__frame mono">
+                          {it.frame.replace(/\.jpg$/, "")}
+                        </span>
+                      )}
+                      {it.unit_id && (
+                        <span className="script-preview__unit mono">
+                          {it.unit_id}
+                        </span>
+                      )}
+                    </div>
+                    <div className="script-preview__caption">
+                      <strong>Caption:</strong> {it.caption || "(none)"}
+                    </div>
+                    {it.kind === "instruction" && (
+                      <div
+                        className={
+                          "script-preview__audio " +
+                          (it.stale ? "script-preview__audio--stale" : "")
+                        }
+                      >
+                        <strong>Audio actually says:</strong>{" "}
+                        {it.audio_text || "(no audio generated)"}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1111,16 +1288,19 @@ function ClipRow(props: {
 
 function PlanEditor(props: {
   plan: Plan;
+  scan: Scan | null;
   onChange: (plan: Plan) => void;
   onToggleExcluded: (frameName: string, excluded: boolean) => void;
 }) {
-  const { plan, onChange, onToggleExcluded } = props;
+  const { plan, scan, onChange, onToggleExcluded } = props;
 
-  // Collect all frames referenced by units so we can show a clean
-  // "excluded frames" UI alongside them.
-  const allFrames = plan.sections.flatMap((s) =>
-    s.units.flatMap((u) => u.frames),
+  // Collect all frames referenced by units (and excluded) so we can
+  // show a clean coverage summary.
+  const allPlannedFrames = new Set(
+    plan.sections.flatMap((s) => s.units.flatMap((u) => u.frames)),
   );
+  const scanFrames = scan?.key_frames.map((kf) => kf.name) ?? [];
+  const missingFromPlan = scanFrames.filter((f) => !allPlannedFrames.has(f));
   const isExcluded = (frameName: string) =>
     plan.excluded_frames.includes(frameName);
 
@@ -1170,6 +1350,21 @@ function PlanEditor(props: {
         Every text field below autosaves on edit. Exclude a frame to drop it
         from the final video (it stays on disk).
       </p>
+      {scan && (
+        <p className={`plan-editor__coverage ${missingFromPlan.length > 0 ? "plan-editor__coverage--warn" : ""}`}>
+          {missingFromPlan.length === 0 ? (
+            <>
+              ✓ All {scanFrames.length} scan frames are placed in the plan.
+            </>
+          ) : (
+            <>
+              ⚠ {scanFrames.length - missingFromPlan.length} of {scanFrames.length} scan frames placed;{" "}
+              {missingFromPlan.length} not yet in any unit:{" "}
+              {missingFromPlan.map((f) => f.replace(/\.jpg$/, "")).join(", ")}
+            </>
+          )}
+        </p>
+      )}
 
       {plan.sections.map((section, si) => (
         <div key={section.id} className="plan-section">
@@ -1277,7 +1472,7 @@ function PlanEditor(props: {
         </div>
       ))}
 
-      {allFrames.length > 0 && plan.excluded_frames.length > 0 && (
+      {allPlannedFrames.size > 0 && plan.excluded_frames.length > 0 && (
         <div className="plan-editor__excluded">
           <div className="status-label">Excluded frames</div>
           <div className="plan-editor__excluded-list">
@@ -1448,10 +1643,38 @@ function RenderSection(props: {
     }
   };
 
+  // Phase 1.7g — chapter-aware render. Different output file:
+  // output_plan.mp4, so the user can compare with the legacy output.
+  const renderFromPlan = async () => {
+    if (rendering) return;
+    setRendering(true);
+    setProgress(null);
+    try {
+      await invoke("render_video_from_plan", { projectDir: project.dir });
+      const updated: Project = await invoke("load_project", {
+        projectDir: project.dir,
+      });
+      onProjectChange(updated);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    } finally {
+      setRendering(false);
+    }
+  };
+
   const openOutput = async () => {
     try {
       const { openPath } = await import("@tauri-apps/plugin-opener");
       await openPath(`${project.dir}/output.mp4`);
+    } catch (e: any) {
+      onError(e?.message || String(e));
+    }
+  };
+
+  const openPlanOutput = async () => {
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(`${project.dir}/output_plan.mp4`);
     } catch (e: any) {
       onError(e?.message || String(e));
     }
@@ -1515,7 +1738,7 @@ function RenderSection(props: {
         {allRendered && !rendering && (
           <>
             <button onClick={render} disabled={rendering} className="small">
-              Re-render
+              Re-render (legacy)
             </button>
             <button onClick={revealOutput} className="small">
               Show in Finder
@@ -1527,13 +1750,27 @@ function RenderSection(props: {
         )}
         {(!allRendered || rendering) && (
           <button
-            className="primary"
+            className="small"
             onClick={render}
             disabled={!canRender || rendering}
+            title="Phase 1.5/1.6 per-frame render. Uses narration.json."
           >
-            {rendering ? "Rendering…" : "Render video"}
+            {rendering ? "Rendering…" : "Render (legacy)"}
           </button>
         )}
+        {/* Phase 1.7g — chapter-aware render. Available whenever any clip
+            has plan.json + plan_manifest.json. */}
+        <button
+          className="primary"
+          onClick={renderFromPlan}
+          disabled={rendering}
+          title="Phase 1.7g — chapter-aware render. Uses plan.json + plan_manifest.json."
+        >
+          {rendering ? "Rendering…" : "Render from plan ▶"}
+        </button>
+        <button onClick={openPlanOutput} className="small">
+          ▶ Play output_plan.mp4
+        </button>
       </div>
     </div>
   );

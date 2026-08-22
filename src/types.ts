@@ -101,8 +101,23 @@ export interface KeyFrame {
   type: "section_divider" | "step";
   summary: string;
   title?: string | null;
+  /** LEGACY — always null in v2 scans, kept for UI compat. */
   ui_action?: string | null;
+  /** LEGACY — always null in v2 scans, kept for UI compat. */
   implicit_topic?: string | null;
+  // ─── Phase 1.7c-v2 structured fields ───────────────────────────────
+  /** The form/screen header (present on every screen) — for context only. */
+  screen_header?: string;
+  /** The ONE specific UI element this frame focuses on. */
+  body_focus?: string;
+  /** One of: field | list | form_list | instructions | heading. */
+  body_kind?: string;
+  /** Demo-er's selected value (e.g. "1", "0"). Trainee picks based on their situation. */
+  visible_value?: string;
+  /** Comma-separated option labels for list/form_list kinds. */
+  visible_options?: string;
+  /** True only when body_kind="heading" with no fields/lists visible. */
+  is_section_divider?: boolean;
 }
 
 export interface Scan {
@@ -140,4 +155,38 @@ export interface Plan {
   version: number;
   sections: PlanSection[];
   excluded_frames: string[];
+}
+
+// Phase 1.7f — plan-audio manifest
+export interface PlanAudioEntry {
+  key: string;
+  audio_name: string;
+  kind: "section_overview" | "instruction" | string;
+  section_id: string;
+  unit_id?: string | null;
+  frames: string[];
+  text: string;
+  duration_seconds: number;
+}
+
+export interface PlanAudioManifest {
+  version: number;
+  entries: PlanAudioEntry[];
+}
+
+// Phase 1.7g — script preview (what the render will actually produce)
+export interface ScriptPreviewItem {
+  kind: "section_title" | "instruction" | "filler" | string;
+  section_id: string;
+  unit_id: string;
+  frame: string;
+  caption: string;
+  audio_text: string;
+  stale: boolean;
+}
+
+export interface ScriptPreview {
+  items: ScriptPreviewItem[];
+  stale_count: number;
+  missing_audio_count: number;
 }

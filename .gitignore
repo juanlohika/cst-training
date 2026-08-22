@@ -33,3 +33,6 @@ models/
 
 # Bundled sidecar binaries (downloaded by build script, not committed)
 src-tauri/binaries/
+
+# dev scratch
+src-tauri/scripts/.scan_cache.json

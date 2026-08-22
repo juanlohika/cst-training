@@ -429,27 +429,52 @@ const PLAN_SCHEMA_VERSION: u32 = 1;
 /// briefly while the previous key frame's audio plays.
 #[derive(Serialize, Deserialize, Clone)]
 struct KeyFrame {
-    /// Frame filename in the clip, e.g. "0007.jpg". Must match an
-    /// extracted frame on disk.
+    /// Frame filename in the clip, e.g. "0007.jpg".
     name: String,
-    /// "section_divider" | "step".
+    /// "section_divider" | "step". Derived from is_section_divider for
+    /// backwards-compatible UI display.
     #[serde(rename = "type")]
     kind: String,
-    /// One short sentence of what's happening here (input to plan stage).
+    /// Human-readable one-line summary, assembled from the structured fields
+    /// below. The UI displays this directly. The plan stage IGNORES this and
+    /// reads the structured fields.
     summary: String,
-    /// For section_divider: the section title text on screen.
-    /// For step: null.
+    /// For section_divider frames, the on-screen heading text. None for step.
     #[serde(default)]
     title: Option<String>,
-    /// For step: what UI action is happening or about to happen,
-    /// e.g. "tap Menu icon top-left", "select Store ID from dropdown".
-    /// For section_divider: null.
+    /// LEGACY field kept for UI compat. Always None in v2 scans.
     #[serde(default)]
     ui_action: Option<String>,
-    /// AI's grouping hint — short noun phrase. Plan stage uses this to
-    /// cluster steps into sections when section_dividers are sparse.
+    /// LEGACY field kept for UI compat. Always None in v2 scans.
     #[serde(default)]
     implicit_topic: Option<String>,
+    // ─── Structured fields (Phase 1.7c-v2) ────────────────────────────
+    /// The form/screen header text — present on every screen, identifies
+    /// which form is open. Plan stage uses this for context but NEVER
+    /// repeats it on each instruction.
+    #[serde(default)]
+    screen_header: String,
+    /// The ONE specific UI element this frame is focused on
+    /// (e.g. "FF Store Surveyed", "Refused to Sign Memo").
+    #[serde(default)]
+    body_focus: String,
+    /// One of: "field" | "list" | "form_list" | "instructions" | "heading".
+    /// Drives which narration template the plan stage picks.
+    #[serde(default)]
+    body_kind: String,
+    /// For body_kind=field: the value shown next to the field
+    /// (e.g. "1", "0"). This is the DEMO-er's pick; the trainee picks based
+    /// on their own situation. Plan stage uses this to know the field is a
+    /// choice field but NEVER narrates this specific value as the answer.
+    #[serde(default)]
+    visible_value: String,
+    /// For body_kind=list / form_list: comma-separated option labels
+    /// extracted from the OCR. Plan stage shows up to 3 in the narration.
+    #[serde(default)]
+    visible_options: String,
+    /// True only when body_kind="heading" AND no fields/lists visible.
+    #[serde(default)]
+    is_section_divider: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -615,10 +640,17 @@ async fn scan_clip(
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "label": { "type": "string", "enum": ["A", "B"] },
-                "summary": { "type": "string" }
+                "screen_header": { "type": "string" },
+                "body_focus": { "type": "string" },
+                "body_kind": {
+                    "type": "string",
+                    "enum": ["field", "list", "form_list", "instructions", "heading"]
+                },
+                "visible_value": { "type": "string" },
+                "visible_options": { "type": "string" },
+                "is_section_divider": { "type": "boolean" }
             },
-            "required": ["label", "summary"]
+            "required": ["body_focus", "body_kind", "is_section_divider"]
         });
         let body = serde_json::json!({
             "model": OLLAMA_SCAN_MODEL,
@@ -626,7 +658,7 @@ async fn scan_clip(
             "stream": false,
             "format": schema,
             "options": {
-                "num_predict": 100,
+                "num_predict": 220,
                 "temperature": 0.2,
             }
         });
@@ -659,10 +691,20 @@ async fn scan_clip(
         let raw = json.get("response").and_then(|v| v.as_str()).unwrap_or("");
         let cleaned = raw.trim();
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
         struct ClassifyResponse {
-            label: String,
-            summary: String,
+            #[serde(default)]
+            screen_header: String,
+            #[serde(default)]
+            body_focus: String,
+            #[serde(default)]
+            body_kind: String,
+            #[serde(default)]
+            visible_value: String,
+            #[serde(default)]
+            visible_options: String,
+            #[serde(default)]
+            is_section_divider: bool,
         }
         let parsed: ClassifyResponse = match serde_json::from_str(cleaned) {
             Ok(p) => p,
@@ -672,32 +714,66 @@ async fn scan_clip(
             }
         };
 
-        let kind = match parsed.label.trim().to_uppercase().as_str() {
-            "A" => "section_divider",
-            "B" => "step",
-            _ => "step",
+        let body_focus = parsed.body_focus.trim().to_string();
+        if body_focus.is_empty() {
+            // Frame has no extractable focus — treat as continuation, skip.
+            skipped_empty += 1;
+            continue;
         }
-        .to_string();
 
-        // For section dividers, use the OCR snippet as the title hint.
-        // (Plan stage can clean it up; we just need a starting point.)
+        let body_kind = match parsed.body_kind.trim() {
+            "field" | "list" | "form_list" | "instructions" | "heading" => {
+                parsed.body_kind.trim().to_string()
+            }
+            _ => "field".to_string(),
+        };
+
+        // Scrub OCR noise out of visible_value. The OCR mis-reads dropdown
+        // arrows as "Vv" / "v." / "v" and sometimes captures stray label
+        // fragments. A real demo value here is "0", "1", or a 1-2 char token.
+        let visible_value = sanitize_visible_value(parsed.visible_value.trim());
+
+        // Scrub OCR noise out of visible_options (longer list of garbage tokens).
+        let visible_options = sanitize_visible_options(parsed.visible_options.trim());
+
+        let kind = if parsed.is_section_divider || body_kind == "heading" {
+            "section_divider".to_string()
+        } else {
+            "step".to_string()
+        };
+
+        // Build a UI-friendly summary string from the (cleaned) structured fields.
+        let mut summary = String::new();
+        summary.push_str(&body_focus);
+        if !visible_value.is_empty() {
+            summary.push_str(" (value: ");
+            summary.push_str(&visible_value);
+            summary.push(')');
+        }
+        if !visible_options.is_empty() {
+            summary.push_str(" — options: ");
+            summary.push_str(&visible_options);
+        }
+
         let title = if kind == "section_divider" {
-            Some(snippet.chars().take(80).collect::<String>())
+            Some(body_focus.clone())
         } else {
             None
         };
-        // ui_action is left None at the scan stage — the next stage
-        // (plan_script with minicpm-v) derives the actual imperative
-        // action from the summary + OCR text. Copying summary into
-        // ui_action made the UI look like duplicated text and added
-        // no real information.
+
         key_frames.push(KeyFrame {
             name: name.clone(),
             kind,
-            summary: parsed.summary,
+            summary,
             title,
             ui_action: None,
             implicit_topic: None,
+            screen_header: parsed.screen_header.trim().to_string(),
+            body_focus,
+            body_kind,
+            visible_value,
+            visible_options,
+            is_section_divider: parsed.is_section_divider,
         });
     }
 
@@ -751,50 +827,87 @@ fn run_tesseract(image: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Per-frame OCR-classifier prompt for llama3.2:3b.
-fn build_ocr_classify_prompt(main_prompt: &str, ocr_text: &str) -> String {
+/// Per-frame OCR-classifier prompt for llama3.2:3b. Forces structured-slot
+/// extraction (not free-text summary) — small models latch onto example
+/// summaries in prompts and copy them across unrelated frames. See
+/// memory: cst-studio-template-plan.
+///
+/// IMPORTANT: this prompt does NOT receive the project's main_prompt. The
+/// scan stage is pure visual observation of what's on each frame; the
+/// main_prompt's instructional phrasing would otherwise contaminate the
+/// extracted fields (small models can't reliably distinguish prompt-context
+/// from OCR-data and will copy phrases like "select the form" into
+/// body_focus). Project context is applied later in the plan stage.
+fn build_ocr_classify_prompt(_main_prompt: &str, ocr_text: &str) -> String {
     let mut p = String::new();
     p.push_str(
-        "You are classifying one frame from a training video by reading \
-         the on-screen text extracted via OCR. Your output will be used \
-         to write a step-by-step training script later.\n\n",
+        "You read OCR text from one frame of a mobile-app training video and \
+         extract structured information.\n\n",
     );
-    if !main_prompt.trim().is_empty() {
-        p.push_str("Project context: ");
-        p.push_str(main_prompt.trim());
-        p.push_str("\n\n");
-    }
-    p.push_str("OCR text from this frame:\n");
-    p.push_str("\"\"\"\n");
+    p.push_str(
+        "The OCR text includes status-bar gibberish (\"9:24 tas ll\" etc.) and \
+         the app's HEADER bar (form name like \"AMIl Operator Promo \
+         Implementation - June 2026\" present on EVERY frame). The header tells \
+         you which form is open, NOT whether this is a section-divider frame. \
+         Ignore both for classification — they are NOT the focus.\n\n",
+    );
+    p.push_str("OCR text:\n\"\"\"\n");
     p.push_str(ocr_text);
     p.push_str("\n\"\"\"\n\n");
     p.push_str(
-        "STEP 1 — Classify:\n\
-         A = section divider / title slide (short 1-5 word title centered, \
-            intro of a new topic, NO form fields or buttons visible)\n\
-         B = action step (UI screen with specific elements: form fields, \
-            dropdowns, button labels, list items, menu items)\n\
+        "EXTRACTION RULES — fill these JSON fields by reading the OCR above:\n\
          \n\
-         STEP 2 — For your summary, you MUST:\n\
-         - Reference at least ONE specific UI element BY NAME from the OCR text above.\n\
-         - Use exact labels from the OCR (e.g. \"FF Store Surveyed\", \"Promo \
-            Implementation Form\", \"BPI\", \"China Bank\", \"Trade Presenter\", \
-            \"Refused to Sign Memo\") — do NOT genericize to \"UI element\" or \
-            \"form field\".\n\
-         - Write what the operator is doing or what is on screen, in 10-15 words.\n\
-         - When on-screen text is ALL CAPS, write it in Title Case in your summary.\n\
+         \"screen_header\": copy the form/screen header text (the line near the \
+            top showing which form is open). If none, write \"\".\n\
+         \"body_focus\": the SINGLE most prominent body element — a field name, \
+            list heading, or section title visible in the body. Use the EXACT \
+            label from the OCR. STRIP any trailing question/help text (e.g. \
+            \"FF STORE SURVEYED / Did you visit or speak...\" → \"FF STORE SURVEYED\").\n\
+         \"body_kind\": one of:\n\
+             \"field\"      — body shows a single field/dropdown. SIGNALS: a \
+                label (often ALL CAPS or with a trailing \"*\") followed by \
+                help text or a question, followed by a numeric value like \"1\", \
+                \"0\", or a \"v\"/\"Vv\" dropdown indicator.\n\
+             \"list\"       — body shows MULTIPLE choice items as a list (3+ \
+                items stacked), like banks (BPI, China Bank, HSBC), promo \
+                non-implementation reasons, or product variants with arrows.\n\
+             \"form_list\"  — body shows the \"App Forms\" listing — multiple \
+                FORM NAMES the user picks one of.\n\
+             \"instructions\" — body shows ONLY explanatory help copy (\"To begin \
+                your day, please tap on Menu...\"), no field label, no value.\n\
+             \"heading\"    — body has ONLY a short heading/title with nothing \
+                else interactive.\n\
+         \"visible_value\": if body_kind=field and a value like \"1\", \"0\", or \
+            \"Vv\" appears near the field label, copy it EXACTLY. Otherwise \"\".\n\
+         \"visible_options\": if body_kind=list/form_list, list up to 5 option \
+            labels from the OCR, comma-separated. Otherwise \"\".\n\
+         \"is_section_divider\": true ONLY when body_kind=\"heading\". False \
+            otherwise.\n\
          \n\
-         BAD examples (do NOT do this):\n\
-         - \"User interacts with UI screen elements\" (too generic)\n\
-         - \"User interacts with promo implementation form\" (no specific element)\n\
+         DECISION HINTS:\n\
+         - ALL-CAPS labels (\"FF STORE SURVEYED\", \"TV/LFD\") are NOT headings — \
+            they are field labels. If a value 1/0/Vv appears nearby → field.\n\
+         - \"App Forms\" with multiple form-name entries → form_list.\n\
+         - 3+ option strings stacked vertically with arrow indicators → list.\n\
+         - Help/instruction copy with NO field label or value → instructions.\n\
          \n\
-         GOOD examples (DO this):\n\
-         - \"Operator opens the App Forms list, AMII Promo Implementation visible\"\n\
-         - \"Operator selects 1 in the FF Store Surveyed dropdown\"\n\
-         - \"Operator chooses Refused to Sign Memo as the non-implementation reason\"\n\
-         - \"Operator confirms the China Bank entry in the bank list\"\n\
+         CRITICAL — only use text actually present in the OCR block above:\n\
+         - body_focus MUST be a phrase that appears verbatim in the OCR text. \
+            If you cannot copy/paste the focus from the OCR above, leave it empty.\n\
+         - DO NOT add prefix verbs like \"Select the\", \"Tap the\", \"Choose the\". \
+            body_focus is a NOUN PHRASE only (the field label or list heading).\n\
+         - visible_value MUST be a SHORT token actually adjacent to the field \
+            in the OCR (e.g. \"1\", \"0\", \"Vv\"). NEVER a sentence, NEVER an \
+            instruction, NEVER text copied from project context.\n\
+         - visible_options MUST be option labels copied from the OCR.\n\
+         - Status-bar gibberish at line starts is NOISE — ignore.\n\
+         - Bottom-nav gibberish at line end (\"Ul O <\", \"Il O K\") is NOISE.\n\
+         - The screen_header goes in screen_header, NOT body_focus.\n\
          \n\
-         Reply with JSON only: {\"label\": \"A\" or \"B\", \"summary\": \"...\"}",
+         Reply with JSON only, no preamble:\n\
+         {\"screen_header\": \"...\", \"body_focus\": \"...\", \"body_kind\": \"...\", \
+         \"visible_value\": \"...\", \"visible_options\": \"...\", \
+         \"is_section_divider\": false}",
     );
     p
 }
@@ -979,12 +1092,15 @@ async fn plan_script(
     project_dir: String,
     clip_id: String,
 ) -> Result<Plan, String> {
-    let project = load_project(project_dir.clone())?;
-    let clip = project
-        .clips
-        .iter()
-        .find(|c| c.id == clip_id)
-        .ok_or_else(|| format!("No clip with id {clip_id}"))?;
+    // Phase 1.7c-v2: code-driven plan assembly.
+    //
+    // The scan stage produced structured KeyFrames (body_focus, body_kind,
+    // visible_value, visible_options, is_section_divider). This function
+    // assembles the plan deterministically from those structured fields —
+    // no LLM call. See memory: cst-studio-template-plan for the rationale
+    // (12 iterations of prompt engineering with minicpm-v:8b couldn't reliably
+    // follow all the narration rules at once; templates do it perfectly).
+    let _project = load_project(project_dir.clone())?;
 
     let scan = load_scan(project_dir.clone(), clip_id.clone())?
         .ok_or_else(|| "Smart scan must be run first.".to_string())?;
@@ -992,155 +1108,139 @@ async fn plan_script(
         return Err("Scan produced no key frames — nothing to plan.".into());
     }
 
-    let prompt = build_plan_prompt(&project.main_prompt, &clip.title, &clip.overview, &scan);
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("Cannot build HTTP client: {e}"))?;
+    // Walk key_frames in order. Whenever we hit a section_divider, start a
+    // new section. Within a section, each step frame becomes one instruction
+    // unit (one frame per unit — no auto-grouping in v2; the editor lets the
+    // user merge later).
+    let mut sections: Vec<PlanSection> = Vec::new();
+    let mut current_units: Vec<ScriptUnit> = Vec::new();
+    let mut current_title: String = String::new();
+    let mut current_overview: String = String::new();
+    let mut current_divider_frames: Vec<String> = Vec::new();
+    let mut section_idx: usize = 0;
+    let mut unit_idx: usize = 0;
 
-    // Schema: AI produces section groupings only. We stamp the ids ourselves
-    // after parsing.
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "sections": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": { "type": "string" },
-                        "overview": { "type": "string" },
-                        "units": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "enum": ["title_card", "instruction", "filler"]
-                                    },
-                                    "frames": {
-                                        "type": "array",
-                                        "items": { "type": "string" }
-                                    },
-                                    "text": { "type": "string" }
-                                },
-                                "required": ["type", "frames"]
-                            }
-                        }
-                    },
-                    "required": ["title", "overview", "units"]
-                }
-            }
-        },
-        "required": ["sections"]
-    });
-
-    let body = serde_json::json!({
-        "model": OLLAMA_VISION_MODEL, // minicpm-v:8b — text-only invocation
-        "prompt": prompt,
-        "stream": false,
-        "format": schema,
-        "options": {
-            // Plan output can be substantial: 4-8 sections * 3-6 units each.
-            // 2000 tokens covers a 20-section plan with room to spare.
-            "num_predict": 2000,
-            "temperature": 0.3,
+    fn flush_section(
+        sections: &mut Vec<PlanSection>,
+        units: &mut Vec<ScriptUnit>,
+        title: &mut String,
+        overview: &mut String,
+        divider_frames: &mut Vec<String>,
+        section_idx: usize,
+    ) {
+        if units.is_empty() && divider_frames.is_empty() {
+            return;
         }
-    });
-
-    let resp = http
-        .post(OLLAMA_URL)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Cannot reach Ollama at {OLLAMA_URL}: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Ollama returned {status}: {text}"));
-    }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Ollama response not JSON: {e}"))?;
-    let raw = json
-        .get("response")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Ollama response missing 'response' field".to_string())?;
-
-    #[derive(Deserialize)]
-    struct PlanResponse {
-        sections: Vec<PlanSectionResponse>,
-    }
-    #[derive(Deserialize)]
-    struct PlanSectionResponse {
-        title: String,
-        overview: String,
-        units: Vec<UnitResponse>,
-    }
-    #[derive(Deserialize)]
-    struct UnitResponse {
-        #[serde(rename = "type")]
-        kind: String,
-        frames: Vec<String>,
-        #[serde(default)]
-        text: Option<String>,
-    }
-
-    let parsed: PlanResponse = serde_json::from_str(raw.trim()).map_err(|e| {
-        format!(
-            "Plan AI returned invalid JSON: {e}\nRaw (first 500 chars):\n{}",
-            &raw.chars().take(500).collect::<String>()
-        )
-    })?;
-
-    // Validate frame names against scan's key_frames; drop unknowns.
-    let valid_frames: std::collections::HashSet<&String> =
-        scan.key_frames.iter().map(|kf| &kf.name).collect();
-
-    let mut sections: Vec<PlanSection> = Vec::with_capacity(parsed.sections.len());
-    for (si, s) in parsed.sections.into_iter().enumerate() {
-        let mut units: Vec<ScriptUnit> = Vec::with_capacity(s.units.len());
-        for (ui, u) in s.units.into_iter().enumerate() {
-            let valid_unit_frames: Vec<String> = u
-                .frames
-                .into_iter()
-                .filter(|f| valid_frames.contains(f))
-                .collect();
-            if valid_unit_frames.is_empty() {
-                continue; // skip empty units
-            }
-            let kind = match u.kind.as_str() {
-                "title_card" | "instruction" | "filler" => u.kind,
-                _ => "instruction".to_string(),
-            };
-            // Filler + title_card never have text.
-            let text = if kind == "filler" || kind == "title_card" {
-                None
-            } else {
-                u.text.filter(|t| !t.trim().is_empty())
-            };
-            units.push(ScriptUnit {
-                id: format!("u{si:02}_{ui:02}"),
-                kind,
-                frames: valid_unit_frames,
-                text,
+        let mut all_units: Vec<ScriptUnit> = Vec::new();
+        if !divider_frames.is_empty() {
+            all_units.push(ScriptUnit {
+                id: format!("u{section_idx:02}_title"),
+                kind: "title_card".to_string(),
+                frames: std::mem::take(divider_frames),
+                text: None,
             });
         }
-        if units.is_empty() {
+        all_units.extend(std::mem::take(units));
+        sections.push(PlanSection {
+            id: format!("s{section_idx:02}"),
+            title: std::mem::take(title),
+            overview: std::mem::take(overview),
+            units: all_units,
+        });
+    }
+
+    for kf in &scan.key_frames {
+        let is_divider = kf.is_section_divider || kf.kind == "section_divider";
+        if is_divider {
+            // Close the previous section if it has content.
+            if !current_units.is_empty() || !current_divider_frames.is_empty() {
+                flush_section(
+                    &mut sections,
+                    &mut current_units,
+                    &mut current_title,
+                    &mut current_overview,
+                    &mut current_divider_frames,
+                    section_idx,
+                );
+                section_idx += 1;
+                unit_idx = 0;
+            }
+            // Start the new section with this divider's title.
+            current_title = title_case_label(
+                &strip_required_marker(kf.title.as_deref().unwrap_or(&kf.body_focus)),
+            );
+            // No auto-generated section overview. Section title cards play
+            // silent (the title text alone is enough orientation). If you
+            // want narrated section intros, edit overview in the plan editor
+            // — Phase 2 will surface it in the UI.
+            current_overview = String::new();
+            current_divider_frames.push(kf.name.clone());
             continue;
         }
+
+        // Step frame — pick the right template based on body_kind.
+        let text = render_unit_text(kf);
+        let unit_kind = if text.trim().is_empty() {
+            "filler"
+        } else {
+            "instruction"
+        };
+        current_units.push(ScriptUnit {
+            id: format!("u{section_idx:02}_{unit_idx:02}"),
+            kind: unit_kind.to_string(),
+            frames: vec![kf.name.clone()],
+            text: if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            },
+        });
+        unit_idx += 1;
+    }
+
+    // Flush the final section.
+    flush_section(
+        &mut sections,
+        &mut current_units,
+        &mut current_title,
+        &mut current_overview,
+        &mut current_divider_frames,
+        section_idx,
+    );
+
+    // If we never hit a section divider, wrap everything in one synthetic
+    // section so the plan is still well-formed.
+    if sections.is_empty() && !scan.key_frames.is_empty() {
+        let units: Vec<ScriptUnit> = scan
+            .key_frames
+            .iter()
+            .enumerate()
+            .map(|(i, kf)| {
+                let text = render_unit_text(kf);
+                let kind = if text.trim().is_empty() {
+                    "filler"
+                } else {
+                    "instruction"
+                };
+                ScriptUnit {
+                    id: format!("u00_{i:02}"),
+                    kind: kind.to_string(),
+                    frames: vec![kf.name.clone()],
+                    text: if text.trim().is_empty() { None } else { Some(text) },
+                }
+            })
+            .collect();
         sections.push(PlanSection {
-            id: format!("s{si:02}"),
-            title: s.title.trim().to_string(),
-            overview: s.overview.trim().to_string(),
+            id: "s00".to_string(),
+            title: "Walkthrough".to_string(),
+            // Silent fallback overview — see comment in flush_section block.
+            overview: String::new(),
             units,
         });
     }
 
     if sections.is_empty() {
-        return Err("Plan AI produced no valid sections.".into());
+        return Err("Plan produced no sections — scan output was empty.".into());
     }
 
     let plan = Plan {
@@ -1151,6 +1251,202 @@ async fn plan_script(
     let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
     write_plan_file(&clip_dir, &plan)?;
     Ok(plan)
+}
+
+/// Strip the trailing "*" required-field marker from a UI label.
+fn strip_required_marker(s: &str) -> String {
+    s.trim().trim_end_matches('*').trim().to_string()
+}
+
+/// Drop OCR noise that the scan LLM sometimes parks in `visible_value`.
+/// Real demo values are "0", "1", or short tokens. The OCR mis-reads
+/// dropdown arrows as "Vv" / "v." / "v" — those are NOT values.
+/// Returns "" when the candidate is noise.
+fn sanitize_visible_value(raw: &str) -> String {
+    let cleaned = strip_required_marker(raw);
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    const NOISE: &[&str] = &[
+        "vv", "v.", "v", "vv ", "/", "ie", "ie)", "1 €", "0 €",
+        "1 vv", "0 vv", "€", "©", "®", "—", "-",
+    ];
+    if NOISE.iter().any(|n| n == &lower.as_str()) {
+        return String::new();
+    }
+    // Real demo values are short. Anything > 6 chars is probably a stray
+    // OCR fragment (label text, help text, etc.). Common real values:
+    // "0", "1", "Yes", "No", "N/A".
+    if cleaned.chars().count() > 6 {
+        return String::new();
+    }
+    cleaned
+}
+
+/// Drop OCR noise from the comma-separated visible_options string.
+/// More aggressive than clean_options() since it runs at scan time on
+/// the raw LLM output.
+fn sanitize_visible_options(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    const NOISE_TOKENS: &[&str] = &[
+        "vv", "v.", "v", "/", "—", "-", "€", "©", "®",
+        "1 vv", "0 vv",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for opt in raw.split(',') {
+        let cleaned = strip_required_marker(opt);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+        if NOISE_TOKENS.iter().any(|n| n == &lower.as_str()) {
+            continue;
+        }
+        // Skip pure-numeric or pure-punctuation tokens (less than 2 letters).
+        let letter_count = cleaned.chars().filter(|c| c.is_alphabetic()).count();
+        if letter_count < 2 {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == &cleaned) {
+            out.push(cleaned);
+        }
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    out.join(", ")
+}
+
+/// Title-Case a label, preserving short product codes / acronyms. Used to
+/// convert ALL-CAPS OCR labels like "FF STORE SURVEYED" → "FF Store Surveyed"
+/// while leaving "BPI", "HSBC", "TV/LFD" intact.
+fn title_case_label(s: &str) -> String {
+    const KEEP_UPPER: &[&str] = &[
+        "FF", "TV", "LFD", "CC", "BPI", "HSBC", "PNB", "FSM", "MCS", "OIC",
+        "AMII", "CIA", "AS7", "A37", "ZFold7", "S26", "FB", "IG", "DPOoP",
+    ];
+    let mut out = Vec::new();
+    for word in s.split_whitespace() {
+        let bare: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        let is_keep = KEEP_UPPER.iter().any(|k| k.eq_ignore_ascii_case(&bare));
+        if is_keep || (bare.len() <= 3 && bare.chars().all(|c| c.is_ascii_uppercase())) {
+            out.push(word.to_string());
+        } else if word.chars().all(|c| c.is_ascii_uppercase() || !c.is_ascii_alphabetic()) {
+            // Whole word is uppercase letters + punctuation — title-case it.
+            let mut chars = word.chars();
+            let mut s = String::new();
+            if let Some(c) = chars.next() {
+                s.push(c.to_ascii_uppercase());
+            }
+            for c in chars {
+                s.push(c.to_ascii_lowercase());
+            }
+            out.push(s);
+        } else {
+            out.push(word.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+/// Field-name → decision-criterion phrase. This IS the Phase 1 knowledge
+/// bank — Phase 2 will move it to an editable JSON/YAML file with a
+/// platform selector. For now it's a hardcoded lookup table.
+fn derive_criterion(focus: &str, kind: &str) -> String {
+    let f = focus.to_ascii_lowercase();
+    if f.contains("ff store surveyed") {
+        return "based on whether you surveyed the FF store at this location".into();
+    }
+    if f.contains("tv/lfd") || f.contains("tv lfd") {
+        return "based on the actual TV/LFD condition at the store".into();
+    }
+    if f.contains("cc offers") {
+        return "based on the actual CC Offers implementation status at the location".into();
+    }
+    if f.contains("time in") {
+        return "based on the actual time you arrived at the location".into();
+    }
+    if f.contains("promo non-implementation reason") {
+        return "matching the actual reason the promo was not implemented at this store".into();
+    }
+    if f.contains("ultra color") || f.contains("s26 series") || f.contains("zfold") || f.contains("feature kv") {
+        return format!(
+            "based on actual deployment of the {} display at the store",
+            title_case_label(&strip_required_marker(focus))
+        );
+    }
+    if f.contains("competitor deployment") || f.contains("competitor inventory") {
+        return "matching what you observed of competitor activity at the location".into();
+    }
+    match kind {
+        "form_list" => String::new(),
+        "list" => "matching what you observed at the store".into(),
+        _ => "based on what you observed on site".into(),
+    }
+}
+
+/// Filter OCR-garbage tokens out of a comma-separated options string.
+fn clean_options(raw: &str) -> Vec<String> {
+    const NOISE: &[&str] = &["Vv", "v.", "v", "Mother's Day²", "Mother's Day*"];
+    raw.split(',')
+        .map(|o| strip_required_marker(o.trim()))
+        .filter(|o| {
+            !o.is_empty()
+                && !NOISE.iter().any(|n| n.eq_ignore_ascii_case(o))
+        })
+        .fold(Vec::new(), |mut acc, o| {
+            if !acc.contains(&o) {
+                acc.push(o);
+            }
+            acc
+        })
+}
+
+/// Render the narration text for one step-frame unit by picking the right
+/// template based on body_kind. Returns "" for kinds that shouldn't have
+/// narration (currently: nothing — even instructions kind gets text).
+fn render_unit_text(kf: &KeyFrame) -> String {
+    let focus_clean = title_case_label(&strip_required_marker(&kf.body_focus));
+    if focus_clean.is_empty() {
+        return String::new();
+    }
+    let has_value = !kf.visible_value.trim().is_empty();
+    let criterion = derive_criterion(&kf.body_focus, &kf.body_kind);
+
+    match kf.body_kind.as_str() {
+        "field" if has_value => {
+            format!(
+                "In the {focus_clean} field, select 1 or 0, {criterion}."
+            )
+        }
+        "field" => format!("Tap the {focus_clean} field to set its value."),
+        "list" => {
+            let opts = clean_options(&kf.visible_options);
+            let opts_str = opts
+                .iter()
+                .take(3)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if opts_str.is_empty() {
+                format!("From the {focus_clean} options, select the one {criterion}.")
+            } else {
+                format!(
+                    "From the {focus_clean} options, select the one {criterion}. Choices include {opts_str}."
+                )
+            }
+        }
+        "form_list" => format!("Tap {focus_clean} from the App Forms list to open it."),
+        "instructions" => format!("On this screen, {focus_clean} is shown."),
+        "heading" => String::new(),
+        _ => format!("Tap the {focus_clean} field to set its value."),
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1215,103 +1511,8 @@ fn write_plan_file(clip_dir: &Path, plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-fn build_plan_prompt(
-    main_prompt: &str,
-    clip_title: &str,
-    clip_overview: &str,
-    scan: &Scan,
-) -> String {
-    let mut p = String::new();
-    p.push_str(
-        "You are writing the script plan for a training video clip. You'll \
-         decide how to group the scanned key frames into sections, what each \
-         section should be titled, and what the narrator says for each step.\n\n",
-    );
-    if !main_prompt.trim().is_empty() {
-        p.push_str("PROJECT CONTEXT:\n");
-        p.push_str(main_prompt.trim());
-        p.push_str("\n\n");
-    }
-    if !clip_title.trim().is_empty() {
-        p.push_str("CLIP TITLE: ");
-        p.push_str(clip_title.trim());
-        p.push('\n');
-    }
-    if !clip_overview.trim().is_empty() {
-        p.push_str("CLIP OVERVIEW: ");
-        p.push_str(clip_overview.trim());
-        p.push_str("\n\n");
-    }
-    p.push_str("SCAN OUTPUT — narrative arc the scan stage produced:\n");
-    p.push_str(scan.narrative_arc.trim());
-    p.push_str("\n\n");
-
-    p.push_str(&format!(
-        "KEY FRAMES ({} total, in order):\n",
-        scan.key_frames.len()
-    ));
-    for kf in &scan.key_frames {
-        p.push_str("- ");
-        p.push_str(&kf.name);
-        p.push_str(" [");
-        p.push_str(&kf.kind);
-        p.push_str("]: ");
-        p.push_str(kf.summary.trim());
-        if let Some(t) = &kf.title {
-            p.push_str(" (title hint: \"");
-            p.push_str(t.trim());
-            p.push_str("\")");
-        }
-        p.push('\n');
-    }
-
-    p.push_str(
-        "\nYOUR JOB:\n\
-         1. Group the key frames into SECTIONS. Use section_divider frames \
-            as natural chapter breaks. If there are no section_divider \
-            frames or only one, infer sections from topic shifts.\n\
-         2. For each section: give it a short title (3-6 words), and write \
-            a 2-3 sentence overview that the narrator says to introduce it.\n\
-         3. Within each section, write ordered SCRIPT UNITS:\n\
-            - type=\"title_card\": ONE per section, wraps the section_divider \
-              frame(s) if any. No text — the section overview is the audio.\n\
-            - type=\"instruction\": narrated step. Each instruction unit \
-              has a 'text' field with the imperative-voice narration line. \
-              Multiple frames can share one instruction unit when the action \
-              spans several frames (e.g. typing into a field across 3 frames).\n\
-            - type=\"filler\": frames briefly shown with no narration (e.g. \
-              transition frames, near-duplicates). No text needed.\n\
-         4. NARRATION STYLE — REQUIRED:\n\
-            - Imperative voice — address the viewer directly. Start with a \
-              verb (Select, Tap, Open, Enter, Confirm, Choose, Scroll).\n\
-            - Reference SPECIFIC UI elements by name (use the labels from \
-              the scan summaries).\n\
-            - DON'T repeat the app name or form name every step — that's \
-              already covered in the overview.\n\
-            - DON'T use \"the user\" / \"the operator\" — speak TO the viewer.\n\
-            - When on-screen text is ALL CAPS, write it in Title Case.\n\
-            - 10-20 words per instruction line.\n\
-         5. RULES:\n\
-            - Every frame from the input list MUST appear in exactly one \
-              unit (don't drop frames; use 'filler' if no narration needed).\n\
-            - Frame names MUST match exactly (e.g. \"0007.jpg\").\n\
-            - Number of sections is your call — usually 2-6 for a typical \
-              training clip.\n\
-         \n\
-         GOOD example narration lines:\n\
-         - \"Tap App Forms from the menu, then select Promo Implementation Form.\"\n\
-         - \"Choose 1 in the FF Store Surveyed dropdown if you visited the store.\"\n\
-         - \"Confirm by tapping Submit at the bottom of the form.\"\n\
-         \n\
-         BAD examples to AVOID:\n\
-         - \"The user is selecting...\" (observer voice)\n\
-         - \"This screen shows the form\" (describes instead of instructs)\n\
-         - \"In Tarkie App's Promo Implementation Form, tap the field\" (repeats context)\n\
-         \n\
-         Respond with JSON only, matching the schema. No code fences, no preamble.",
-    );
-    p
-}
+// Phase 1.7c-v2 removed build_plan_prompt. The plan stage is now a pure
+// code-driven assembly in plan_script() above — no LLM call.
 
 async fn run_thumbnail_script(clip_dir: &Path) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
@@ -2037,6 +2238,319 @@ struct AudioManifestEntry {
     duration_seconds: f64,
 }
 
+/// Phase 1.7f manifest. One entry per audio file produced by
+/// tts_from_plan.py: either a section-overview clip or a per-unit
+/// instruction clip. Step 1.7g (render) walks this in order.
+#[derive(Serialize, Deserialize, Clone)]
+struct PlanAudioManifest {
+    version: u32,
+    entries: Vec<PlanAudioEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PlanAudioEntry {
+    /// Stable key — "section_<sid>" for overview clips, the unit id
+    /// (e.g. "s00_01") for instruction clips.
+    key: String,
+    audio_name: String,
+    /// "section_overview" | "instruction".
+    kind: String,
+    section_id: String,
+    /// Present for instruction entries.
+    #[serde(default)]
+    unit_id: Option<String>,
+    /// Frames this audio is tied to. For section_overview this is empty
+    /// (the section's title_card unit owns the divider frames). For
+    /// instruction this is the unit's frame list.
+    #[serde(default)]
+    frames: Vec<String>,
+    text: String,
+    duration_seconds: f64,
+}
+
+/// Phase 1.7f: generate audio per plan unit (and per section overview).
+/// Reads plan.json, walks sections and instruction units, and produces
+/// one WAV per narratable item. Skips title_card and filler units.
+#[tauri::command(rename_all = "camelCase")]
+async fn generate_audio_from_plan(
+    app: tauri::AppHandle,
+    project_dir: String,
+    clip_id: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    use std::io::{BufRead, BufReader};
+
+    let mut project = load_project(project_dir.clone())?;
+    let clip_idx = project
+        .clips
+        .iter()
+        .position(|c| c.id == clip_id)
+        .ok_or_else(|| format!("No clip with id {clip_id}"))?;
+
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    let plan_path = clip_dir.join("plan.json");
+    if !plan_path.exists() {
+        return Err("Plan this clip before generating plan audio.".into());
+    }
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let script_path = PathBuf::from(manifest)
+        .join("scripts")
+        .join("tts_from_plan.py");
+    if !script_path.exists() {
+        return Err(format!(
+            "Plan-TTS script not found at {}",
+            script_path.display()
+        ));
+    }
+
+    let clip_id_owned = clip_id.clone();
+    let app_clone = app.clone();
+    let clip_dir_str = clip_dir.to_string_lossy().into_owned();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut child = std::process::Command::new(python_path())
+            .arg(&script_path)
+            .arg(&clip_dir_str)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Cannot spawn python: {e}"))?;
+
+        let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+        let stderr = child.stderr.take().ok_or_else(|| "no stderr".to_string())?;
+
+        let stderr_collector = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut buf = String::new();
+            for line in reader.lines().flatten() {
+                buf.push_str(&line);
+                buf.push('\n');
+                if buf.len() > 8192 {
+                    let cut = buf.len() - 8192;
+                    buf = buf[cut..].to_string();
+                }
+            }
+            buf
+        });
+
+        let reader = BufReader::new(stdout);
+        let mut last_error: Option<String> = None;
+        for line in reader.lines().flatten() {
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let kind = msg.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "loading" | "loaded" | "progress" | "done" => {
+                    let progress = TtsProgress {
+                        clip_id: clip_id_owned.clone(),
+                        index: msg.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                        total: msg.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                        name: msg
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        stage: kind.to_string(),
+                        duration_seconds: msg.get("duration_seconds").and_then(|v| v.as_f64()),
+                    };
+                    let _ = app_clone.emit("plan-tts-progress", progress);
+                }
+                "error" => {
+                    last_error = Some(
+                        msg.get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let status = child.wait().map_err(|e| format!("python wait failed: {e}"))?;
+        let stderr_text = stderr_collector.join().unwrap_or_default();
+        if !status.success() {
+            let detail = last_error.unwrap_or_else(|| stderr_text.trim().to_string());
+            return Err(format!("Plan TTS script exited {status}: {detail}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Plan TTS task panicked: {e}"))?;
+
+    result?;
+
+    // Mark the clip as audio-ready so the existing render command sees it.
+    project.clips[clip_idx].status = ClipStatus::AudioReady;
+    write_project_file(&project)?;
+    Ok(())
+}
+
+/// What the user will actually see + hear when the chapter-aware render
+/// plays. One entry per playback step, in order. Lets the user verify
+/// the final video matches their script without rendering first.
+#[derive(Serialize, Clone)]
+struct ScriptPreviewItem {
+    /// "section_title" | "instruction" | "filler"
+    kind: String,
+    section_id: String,
+    /// Plan unit id ("u00_03"), or "" for section titles.
+    unit_id: String,
+    /// First frame shown for this step ("0007.jpg").
+    frame: String,
+    /// The visible caption text (from current plan).
+    caption: String,
+    /// The audio text actually recorded in plan_manifest.json.
+    /// Empty if no audio. If this differs from caption, the audio is stale.
+    audio_text: String,
+    /// True if caption != audio_text (i.e. user edited the plan but
+    /// hasn't regenerated audio).
+    stale: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct ScriptPreview {
+    items: Vec<ScriptPreviewItem>,
+    /// Count of units whose caption differs from their audio.
+    stale_count: usize,
+    /// Count of units in the plan that have no audio yet.
+    missing_audio_count: usize,
+}
+
+/// Return the playback sequence the renderer will follow, with current
+/// plan text AND the manifest's audio text side-by-side. Phase 1.7g UI
+/// uses this to show the user exactly what's queued up.
+#[tauri::command(rename_all = "camelCase")]
+fn preview_plan_script(
+    project_dir: String,
+    clip_id: String,
+) -> Result<ScriptPreview, String> {
+    let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip_id);
+    let plan_path = clip_dir.join("plan.json");
+    if !plan_path.exists() {
+        return Ok(ScriptPreview {
+            items: Vec::new(),
+            stale_count: 0,
+            missing_audio_count: 0,
+        });
+    }
+    let raw = fs::read_to_string(&plan_path)
+        .map_err(|e| format!("Cannot read plan.json: {e}"))?;
+    let plan: Plan = serde_json::from_str(&raw)
+        .map_err(|e| format!("plan.json invalid: {e}"))?;
+
+    let manifest = load_plan_audio_manifest(project_dir.clone(), clip_id.clone())?;
+    let manifest_by_key: std::collections::HashMap<&str, &PlanAudioEntry> = manifest
+        .entries
+        .iter()
+        .map(|e| (e.key.as_str(), e))
+        .collect();
+
+    let excluded: std::collections::HashSet<&str> = plan
+        .excluded_frames
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let mut items: Vec<ScriptPreviewItem> = Vec::new();
+    let mut stale_count = 0;
+    let mut missing_audio_count = 0;
+
+    for section in plan.sections.iter() {
+        // Section title — silent in v2 (overview not auto-generated).
+        let section_key = format!("section_{}", section.id);
+        let audio_text = manifest_by_key
+            .get(section_key.as_str())
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        let section_first_frame = section
+            .units
+            .iter()
+            .find(|u| u.kind == "title_card")
+            .and_then(|u| u.frames.first())
+            .cloned()
+            .unwrap_or_default();
+        items.push(ScriptPreviewItem {
+            kind: "section_title".into(),
+            section_id: section.id.clone(),
+            unit_id: String::new(),
+            frame: section_first_frame,
+            caption: section.title.clone(),
+            audio_text,
+            stale: false,
+        });
+
+        for unit in section.units.iter() {
+            if unit.kind == "title_card" {
+                continue; // already covered by section_title above
+            }
+            let active_frames: Vec<&str> = unit
+                .frames
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|f| !excluded.contains(f))
+                .collect();
+            if active_frames.is_empty() {
+                continue;
+            }
+            let first_frame = active_frames[0].to_string();
+            let caption = unit.text.clone().unwrap_or_default();
+            let manifest_text = manifest_by_key
+                .get(unit.id.as_str())
+                .map(|e| e.text.clone())
+                .unwrap_or_default();
+            let is_instruction = unit.kind == "instruction";
+            let stale = is_instruction
+                && !caption.trim().is_empty()
+                && manifest_text.trim() != caption.trim();
+            if is_instruction && !caption.trim().is_empty() && manifest_text.trim().is_empty() {
+                missing_audio_count += 1;
+            } else if stale {
+                stale_count += 1;
+            }
+            items.push(ScriptPreviewItem {
+                kind: unit.kind.clone(),
+                section_id: section.id.clone(),
+                unit_id: unit.id.clone(),
+                frame: first_frame,
+                caption,
+                audio_text: manifest_text,
+                stale,
+            });
+        }
+    }
+
+    Ok(ScriptPreview {
+        items,
+        stale_count,
+        missing_audio_count,
+    })
+}
+
+/// Read the plan-audio manifest written by tts_from_plan.py.
+#[tauri::command(rename_all = "camelCase")]
+fn load_plan_audio_manifest(
+    project_dir: String,
+    clip_id: String,
+) -> Result<PlanAudioManifest, String> {
+    let path = Path::new(&project_dir)
+        .join(CLIPS_DIR)
+        .join(&clip_id)
+        .join("audio")
+        .join("plan_manifest.json");
+    if !path.exists() {
+        return Ok(PlanAudioManifest {
+            version: 1,
+            entries: Vec::new(),
+        });
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("plan_manifest invalid: {e}"))
+}
+
 // ---------- Step (f): final video render ----------
 
 /// Render dimensions are derived per-clip from the source aspect ratio
@@ -2601,6 +3115,468 @@ fn render_clip_video(
     }
     Ok(())
 }
+
+// ============================================================================
+// Phase 1.7g — chapter-aware render
+// ============================================================================
+
+/// How long each filler frame is held on screen (no audio).
+const FILLER_FRAME_DURATION: f64 = 0.5;
+
+/// Render a single clip's video using plan.json + plan_manifest.json instead
+/// of the legacy narration.json + manifest.json path. Walks each section:
+///   - section title card: PNG with section title + overview, narrated by
+///     the section_<sid>.wav audio (this card's frames are the section's
+///     title_card unit's frames if present).
+///   - instruction units: one segment per unit, frames + unit audio + the
+///     unit's narration text as caption. Multi-frame units split the audio
+///     duration evenly across frames.
+///   - filler units: each frame shown for FILLER_FRAME_DURATION with no audio.
+fn render_clip_video_from_plan(
+    project_dir: &str,
+    clip: &Clip,
+    layout: &RenderLayout,
+    out_path: &Path,
+) -> Result<(), String> {
+    let clip_dir = Path::new(project_dir).join(CLIPS_DIR).join(&clip.id);
+    let audio_dir = clip_dir.join("audio");
+    let frames_dir = clip_dir.join(FRAMES_DIR);
+
+    let plan_path = clip_dir.join("plan.json");
+    if !plan_path.exists() {
+        return Err(format!(
+            "Clip {} has no plan.json. Plan the script first.",
+            clip.id
+        ));
+    }
+    let raw = fs::read_to_string(&plan_path)
+        .map_err(|e| format!("Cannot read plan.json: {e}"))?;
+    let plan: Plan = serde_json::from_str(&raw)
+        .map_err(|e| format!("plan.json invalid: {e}"))?;
+
+    let plan_manifest =
+        load_plan_audio_manifest(project_dir.to_string(), clip.id.clone())?;
+    if plan_manifest.entries.is_empty() {
+        return Err(format!(
+            "Clip {} has no plan audio manifest. Generate audio from plan first.",
+            clip.id
+        ));
+    }
+
+    // Index manifest entries by their key for O(1) lookup.
+    let manifest_by_key: std::collections::HashMap<&str, &PlanAudioEntry> = plan_manifest
+        .entries
+        .iter()
+        .map(|e| (e.key.as_str(), e))
+        .collect();
+
+    // Detect stale audio: the plan's current unit text vs the manifest's
+    // recorded text at audio-gen time. If any instruction unit's text
+    // changed (or the unit is new), block the render with a clear message —
+    // otherwise the video would speak the old text while the caption
+    // shows the new one, which is the exact bug the user just reported.
+    let mut stale_units: Vec<(String, String)> = Vec::new(); // (unit_id, summary)
+    let mut missing_units: Vec<String> = Vec::new();
+    for section in plan.sections.iter() {
+        for unit in section.units.iter() {
+            if unit.kind != "instruction" {
+                continue;
+            }
+            let text_now = unit.text.clone().unwrap_or_default();
+            let text_now_trim = text_now.trim();
+            if text_now_trim.is_empty() {
+                continue; // empty units get silent treatment regardless
+            }
+            match manifest_by_key.get(unit.id.as_str()) {
+                None => missing_units.push(unit.id.clone()),
+                Some(m) => {
+                    if m.text.trim() != text_now_trim {
+                        stale_units.push((
+                            unit.id.clone(),
+                            format!(
+                                "  • {}\n      audio says: {}\n      plan says:  {}",
+                                unit.id,
+                                m.text.trim(),
+                                text_now_trim
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !missing_units.is_empty() || !stale_units.is_empty() {
+        let mut msg = String::from(
+            "Plan audio is out of sync with the script. Regenerate audio from plan before rendering.\n\n",
+        );
+        if !missing_units.is_empty() {
+            msg.push_str(&format!(
+                "New units without audio ({}):\n",
+                missing_units.len()
+            ));
+            for id in &missing_units {
+                msg.push_str(&format!("  • {id}\n"));
+            }
+            msg.push('\n');
+        }
+        if !stale_units.is_empty() {
+            msg.push_str(&format!(
+                "Edited units whose audio still plays old text ({}):\n",
+                stale_units.len()
+            ));
+            for (_, line) in &stale_units {
+                msg.push_str(line);
+                msg.push('\n');
+            }
+        }
+        return Err(msg);
+    }
+
+    let excluded: std::collections::HashSet<&str> = plan
+        .excluded_frames
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let segment_dir = clip_dir.join(".render_segments_plan");
+    if segment_dir.exists() {
+        fs::remove_dir_all(&segment_dir)
+            .map_err(|e| format!("Cannot clean segments: {e}"))?;
+    }
+    fs::create_dir_all(&segment_dir)
+        .map_err(|e| format!("Cannot create segments: {e}"))?;
+
+    let mut segment_files: Vec<PathBuf> = Vec::new();
+    let mut seg_idx: usize = 0;
+
+    for section in plan.sections.iter() {
+        // ── Section title card (one per section) ───────────────────────
+        let section_key = format!("section_{}", section.id);
+        let section_audio = manifest_by_key
+            .get(section_key.as_str())
+            .map(|e| audio_dir.join(&e.audio_name));
+
+        // Frames that belong on the title card: the section's first
+        // title_card unit's frames, if any. Otherwise just no frame —
+        // render_title_card draws its own PNG.
+        let title_card_unit = section
+            .units
+            .iter()
+            .find(|u| u.kind == "title_card");
+        let title_frames: Vec<&str> = title_card_unit
+            .map(|u| u.frames.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        let _ = title_frames; // currently unused — title card draws its own bg
+
+        let card_path = segment_dir.join(format!("{seg_idx:04}_section_{}.mp4", section.id));
+        render_title_card(
+            &section.title,
+            "",
+            TITLE_DURATION_SECTION,
+            section_audio.as_deref(),
+            layout,
+            &card_path,
+        )?;
+        segment_files.push(card_path);
+        seg_idx += 1;
+
+        // ── Each instruction/filler unit ───────────────────────────────
+        for unit in section.units.iter() {
+            if unit.kind == "title_card" {
+                continue; // handled above
+            }
+            let active_frames: Vec<&str> = unit
+                .frames
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|f| !excluded.contains(f))
+                .collect();
+            if active_frames.is_empty() {
+                continue;
+            }
+
+            if unit.kind == "instruction" {
+                let manifest_entry = match manifest_by_key.get(unit.id.as_str()) {
+                    Some(e) => *e,
+                    None => {
+                        // No audio for this unit (maybe text was empty when
+                        // audio was generated). Treat as filler.
+                        for frame_name in &active_frames {
+                            let seg_path =
+                                segment_dir.join(format!("{seg_idx:04}_filler.mp4"));
+                            render_filler_frame_segment(
+                                &frames_dir.join(frame_name),
+                                FILLER_FRAME_DURATION,
+                                layout,
+                                &seg_path,
+                            )?;
+                            segment_files.push(seg_path);
+                            seg_idx += 1;
+                        }
+                        continue;
+                    }
+                };
+                let audio_path = audio_dir.join(&manifest_entry.audio_name);
+                if !audio_path.exists() {
+                    return Err(format!(
+                        "Missing audio file {} for unit {}",
+                        audio_path.display(),
+                        unit.id
+                    ));
+                }
+                let total_duration = manifest_entry.duration_seconds;
+                let per_frame =
+                    total_duration / (active_frames.len() as f64).max(1.0);
+                let caption = unit.text.clone().unwrap_or_default();
+                for (idx, frame_name) in active_frames.iter().enumerate() {
+                    let frame_path = frames_dir.join(frame_name);
+                    if !frame_path.exists() {
+                        return Err(format!(
+                            "Missing frame {} for unit {}",
+                            frame_path.display(),
+                            unit.id
+                        ));
+                    }
+                    let seg_path = segment_dir
+                        .join(format!("{seg_idx:04}_{}_{:02}.mp4", unit.id, idx));
+                    if idx == 0 {
+                        // First frame carries the audio for the whole unit.
+                        // The remaining frames split the duration silently.
+                        // For now, simplest: each frame in a multi-frame
+                        // instruction shares the same audio segment by
+                        // splitting it via ffmpeg's atrim. That's complex —
+                        // simpler MVP: ONLY the first frame plays audio,
+                        // the rest are silent stills at per_frame duration.
+                        // (Multi-frame instruction units are rare in v2
+                        // plans anyway since one scan-frame == one unit.)
+                        render_frame_segment(
+                            &frame_path,
+                            &audio_path,
+                            per_frame,
+                            &caption,
+                            layout,
+                            &seg_path,
+                        )?;
+                    } else {
+                        render_filler_frame_segment(
+                            &frame_path,
+                            per_frame,
+                            layout,
+                            &seg_path,
+                        )?;
+                    }
+                    segment_files.push(seg_path);
+                    seg_idx += 1;
+                }
+            } else {
+                // filler kind — silent still per frame.
+                for frame_name in &active_frames {
+                    let frame_path = frames_dir.join(frame_name);
+                    if !frame_path.exists() {
+                        continue;
+                    }
+                    let seg_path = segment_dir.join(format!("{seg_idx:04}_filler.mp4"));
+                    render_filler_frame_segment(
+                        &frame_path,
+                        FILLER_FRAME_DURATION,
+                        layout,
+                        &seg_path,
+                    )?;
+                    segment_files.push(seg_path);
+                    seg_idx += 1;
+                }
+            }
+        }
+    }
+
+    if segment_files.is_empty() {
+        return Err(format!(
+            "Plan render for clip {} produced no segments — every unit was excluded or empty.",
+            clip.id
+        ));
+    }
+
+    // Concat all segments.
+    let list_path = segment_dir.join("concat_list.txt");
+    let list_body: String = segment_files
+        .iter()
+        .map(|p| format!("file '{}'", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&list_path, list_body)
+        .map_err(|e| format!("Cannot write concat list: {e}"))?;
+
+    let status = Command::new(ffmpeg_path())
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-c", "copy"])
+        .arg(out_path)
+        .status()
+        .map_err(|e| format!("ffmpeg concat failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg concat exited {status}"));
+    }
+    Ok(())
+}
+
+/// Render one frame as a silent video segment (no audio, no caption strip).
+/// Used for filler units and for multi-frame instructions' non-first frames.
+fn render_filler_frame_segment(
+    frame_path: &Path,
+    duration: f64,
+    layout: &RenderLayout,
+    out_path: &Path,
+) -> Result<(), String> {
+    // Same canvas + frame-zone layout as render_frame_segment, but no
+    // caption strip is drawn (we pad the bottom with the caption bg color
+    // so the canvas dimensions stay consistent across segments — that
+    // matters for concat without re-encoding).
+    let filter = format!(
+        "[0:v]scale={fw}:{fh}:force_original_aspect_ratio=decrease,pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2:color=0x222222,setsar=1[frm];\
+         color=c=0x044be4:s={cw}x{sh}:d={dur},setsar=1[strip];\
+         [frm][strip]vstack=inputs=2,format=yuv420p",
+        fw = layout.frame_w,
+        fh = layout.frame_h,
+        cw = layout.canvas_w,
+        sh = layout.strip_h,
+        dur = duration,
+    );
+
+    let status = Command::new(ffmpeg_path())
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-loop", "1", "-t", &format!("{duration}"), "-i"])
+        .arg(frame_path)
+        .args([
+            "-f", "lavfi", "-t", &format!("{duration}"),
+            "-i", "anullsrc=channel_layout=mono:sample_rate=24000",
+        ])
+        .args(["-filter_complex", &filter])
+        .args([
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-shortest",
+        ])
+        .arg(out_path)
+        .status()
+        .map_err(|e| format!("ffmpeg filler segment failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg filler segment exited {status}"));
+    }
+    Ok(())
+}
+
+/// Phase 1.7g top-level command — render the final video using plan-based
+/// pipeline (plan.json + plan_manifest.json) instead of the legacy
+/// per-frame narration pipeline. Falls back to per-frame for clips without
+/// a plan, so projects can mix.
+#[tauri::command(rename_all = "camelCase")]
+async fn render_video_from_plan(
+    app: tauri::AppHandle,
+    project_dir: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let project = load_project(project_dir.clone())?;
+    if project.clips.is_empty() {
+        return Err("Add at least one clip before rendering.".into());
+    }
+    // A clip is ready for plan-render if it has plan.json AND plan_manifest.json.
+    let mut ready_clips: Vec<&Clip> = Vec::new();
+    for clip in project.clips.iter() {
+        let clip_dir = Path::new(&project_dir).join(CLIPS_DIR).join(&clip.id);
+        let plan = clip_dir.join("plan.json");
+        let manifest = clip_dir.join("audio").join("plan_manifest.json");
+        if plan.exists() && manifest.exists() {
+            ready_clips.push(clip);
+        }
+    }
+    if ready_clips.is_empty() {
+        return Err(
+            "No clips have plan + plan audio yet. Run scan → plan → generate audio from plan."
+                .into(),
+        );
+    }
+
+    let layout = detect_render_layout(&project_dir, ready_clips[0])?;
+
+    let work_dir = Path::new(&project_dir).join(".render_plan");
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir).map_err(|e| format!("Cannot clean work dir: {e}"))?;
+    }
+    fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create work dir: {e}"))?;
+
+    let app_clone = app.clone();
+    let emit_progress = move |stage: &str, detail: &str, fraction: f64| {
+        let _ = app_clone.emit(
+            "render-progress",
+            RenderProgress {
+                stage: stage.to_string(),
+                detail: detail.to_string(),
+                fraction,
+            },
+        );
+    };
+
+    let total_clips = ready_clips.len();
+    let mut segment_paths: Vec<PathBuf> = Vec::new();
+
+    // Opening title card (only if the project has one set).
+    if !project.opening_title_text.trim().is_empty() {
+        emit_progress("title", "Rendering opening title", 0.0);
+        let title_path = work_dir.join("00_opening_title.mp4");
+        render_title_card(
+            &project.opening_title_text,
+            "",
+            TITLE_DURATION_OPENING,
+            None,
+            &layout,
+            &title_path,
+        )?;
+        segment_paths.push(title_path);
+    }
+
+    // Per clip: just the clip's plan-rendered video. The section title cards
+    // are produced INSIDE render_clip_video_from_plan, so no extra outer
+    // section card here — sections come from the plan, not the clip list.
+    for (i, clip) in ready_clips.iter().enumerate() {
+        let clip_label = format!("Clip {}/{} ({})", i + 1, total_clips, clip.id);
+        emit_progress(
+            "clip",
+            &format!("Rendering {clip_label}"),
+            (i as f64) / (total_clips as f64),
+        );
+        let clip_path = work_dir.join(format!("{:02}_clip_{}.mp4", i + 1, clip.id));
+        render_clip_video_from_plan(&project_dir, clip, &layout, &clip_path)?;
+        segment_paths.push(clip_path);
+    }
+
+    emit_progress("concat", "Concatenating final video", 0.9);
+    let output_path = Path::new(&project_dir).join("output_plan.mp4");
+    concat_segments_with_crossfade(&segment_paths, &output_path, &layout)?;
+
+    emit_progress("done", "Done", 1.0);
+
+    // Mark clips Rendered so the UI reflects it.
+    let mut project = load_project(project_dir.clone())?;
+    for clip in project.clips.iter_mut() {
+        if clip.status == ClipStatus::AudioReady {
+            clip.status = ClipStatus::Rendered;
+        }
+    }
+    write_project_file(&project)?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Phase 1.5 — legacy per-frame render (kept for projects that haven't moved
+// to the plan-driven pipeline yet)
+// ============================================================================
 
 /// Render one frame as a video segment with caption + audio.
 ///
@@ -3798,7 +4774,11 @@ pub fn run() {
             generate_overview,
             generate_audio,
             load_audio_manifest,
+            generate_audio_from_plan,
+            load_plan_audio_manifest,
+            preview_plan_script,
             render_video,
+            render_video_from_plan,
             scan_clip,
             load_scan,
             plan_script,
